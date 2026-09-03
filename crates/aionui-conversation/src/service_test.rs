@@ -24,7 +24,7 @@ use aionui_api_types::{
     SetConfigOptionRequest, SetConfigOptionResponse,
 };
 use aionui_api_types::{
-    CloneConversationRequest, CreateConversationRequest, ListConversationsQuery, SearchMessagesQuery,
+    ChatFileRef, CloneConversationRequest, CreateConversationRequest, ListConversationsQuery, SearchMessagesQuery,
     SendMessageRequest, UpdateConversationRequest, WebSocketMessage,
 };
 use aionui_common::{
@@ -52,7 +52,10 @@ use tokio::sync::{Notify, broadcast};
 
 use crate::service::ConversationService;
 use crate::skill_resolver::{FixedSkillResolver, ResolvedAgentSkill, SkillResolver};
-use crate::{ConversationAgentTurnRequest, ConversationAgentTurnStatus, ConversationError};
+use crate::{
+    ConversationAgentTurnRequest, ConversationAgentTurnStatus, ConversationError, ConversationTeamOrchestrator,
+    EmbeddedTeamSendResult,
+};
 
 #[path = "service_test/acp_error_recovery_test.rs"]
 mod acp_error_recovery_test;
@@ -238,6 +241,122 @@ impl MockRepo {
             artifacts: Mutex::new(vec![]),
             assistant_snapshots: Mutex::new(vec![]),
         }
+    }
+}
+
+struct MockConversationTeamOrchestrator {
+    repo: Arc<MockRepo>,
+    bind_calls: Mutex<Vec<(String, String)>>,
+    send_calls: Mutex<Vec<(String, String, String, String, Vec<ChatFileRef>)>>,
+}
+
+impl MockConversationTeamOrchestrator {
+    fn new(repo: Arc<MockRepo>) -> Self {
+        Self {
+            repo,
+            bind_calls: Mutex::new(Vec::new()),
+            send_calls: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ConversationTeamOrchestrator for MockConversationTeamOrchestrator {
+    async fn bind_leader(&self, user_id: &str, conversation_id: &str) -> Result<(), ConversationError> {
+        self.bind_calls
+            .lock()
+            .unwrap()
+            .push((user_id.to_owned(), conversation_id.to_owned()));
+        let mut rows = self.repo.rows.lock().unwrap();
+        let row = rows
+            .iter_mut()
+            .find(|row| row.user_id == user_id && row.id == conversation_id)
+            .ok_or_else(|| ConversationError::NotFound {
+                id: conversation_id.to_owned(),
+            })?;
+        let mut extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap();
+        extra["embedded_team_id"] = json!(format!("embedded-{conversation_id}"));
+        extra["slot_id"] = json!("leader-slot");
+        extra["role"] = json!("lead");
+        row.extra = extra.to_string();
+        Ok(())
+    }
+
+    async fn send_message(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        team_id: &str,
+        content: &str,
+        files: Vec<ChatFileRef>,
+    ) -> Result<EmbeddedTeamSendResult, ConversationError> {
+        self.send_calls.lock().unwrap().push((
+            user_id.to_owned(),
+            conversation_id.to_owned(),
+            team_id.to_owned(),
+            content.to_owned(),
+            files,
+        ));
+        Ok(EmbeddedTeamSendResult {
+            message_id: "embedded-message-1".to_owned(),
+            team_run_id: "embedded-run-1".to_owned(),
+        })
+    }
+
+    async fn ensure_runtime(
+        &self,
+        _user_id: &str,
+        _conversation_id: &str,
+        _team_id: &str,
+    ) -> Result<(), ConversationError> {
+        Ok(())
+    }
+
+    async fn sync_leader_identity(
+        &self,
+        _user_id: &str,
+        _conversation_id: &str,
+        _team_id: &str,
+    ) -> Result<(), ConversationError> {
+        Ok(())
+    }
+
+    async fn restart_runtime(
+        &self,
+        _user_id: &str,
+        _conversation_id: &str,
+        _team_id: &str,
+        _slot_id: &str,
+    ) -> Result<(), ConversationError> {
+        Ok(())
+    }
+
+    async fn cancel_run(
+        &self,
+        _user_id: &str,
+        _conversation_id: &str,
+        _team_id: &str,
+        _team_run_id: &str,
+    ) -> Result<(), ConversationError> {
+        Ok(())
+    }
+
+    async fn renew_active_lease(
+        &self,
+        _user_id: &str,
+        _conversation_id: &str,
+        _team_id: &str,
+    ) -> Result<(), ConversationError> {
+        Ok(())
+    }
+
+    async fn remove_for_leader(
+        &self,
+        _user_id: &str,
+        _conversation_id: &str,
+        _team_id: &str,
+    ) -> Result<(), ConversationError> {
+        Ok(())
     }
 }
 
@@ -580,7 +699,10 @@ impl IConversationRepository for MockRepo {
             .filter(|message| {
                 message.position.as_deref() == Some("left")
                     && matches!(message.status.as_deref(), Some("work" | "pending"))
-                    && matches!(message.r#type.as_str(), "text" | "thinking")
+                    && matches!(
+                        message.r#type.as_str(),
+                        "text" | "thinking" | "tool_call" | "tool_group"
+                    )
             })
             .filter_map(|message| {
                 let user_id = rows
@@ -1857,6 +1979,42 @@ async fn create_returns_conversation_with_defaults() {
     assert_eq!(events[0].data["action"], "created");
     assert_eq!(events[0].data["conversation_id"], resp.id);
     assert_eq!(events[0].data["source"], "aionui");
+}
+
+#[tokio::test]
+async fn ordinary_conversation_is_bound_as_embedded_leader_and_send_uses_team_scheduler() {
+    let (svc, _broadcaster, repo, task_manager) = make_service();
+    let orchestrator = Arc::new(MockConversationTeamOrchestrator::new(repo));
+    svc.with_team_orchestrator(orchestrator.clone());
+
+    let conversation = svc.create("user_1", make_create_req()).await.unwrap();
+    assert_eq!(
+        conversation.extra["embedded_team_id"],
+        format!("embedded-{}", conversation.id)
+    );
+    assert_eq!(conversation.extra["slot_id"], "leader-slot");
+    assert_eq!(conversation.extra["role"], "lead");
+    assert!(conversation.extra.get("teamId").is_none());
+    assert_eq!(
+        orchestrator.bind_calls.lock().unwrap().as_slice(),
+        &[("user_1".to_owned(), conversation.id.clone())]
+    );
+
+    let response = svc
+        .send_message("user_1", &conversation.id, make_send_req(), &task_manager)
+        .await
+        .unwrap();
+    assert_eq!(response.msg_id, "embedded-message-1");
+    assert_eq!(response.turn_id, "embedded-run-1");
+    assert!(!response.delivered_midturn);
+
+    let calls = orchestrator.send_calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].0, "user_1");
+    assert_eq!(calls[0].1, conversation.id);
+    assert_eq!(calls[0].2, format!("embedded-{}", conversation.id));
+    assert_eq!(calls[0].3, "Hello");
+    assert!(calls[0].4.is_empty());
 }
 
 // ── Project-bind side branch tests ─────────────────────────────────
@@ -4502,6 +4660,91 @@ async fn get_config_options_returns_active_agent_snapshot() {
     assert_eq!(result.config_options[0].current_value.as_deref(), Some("gpt-5.5"));
 }
 
+#[test]
+fn qoder_config_options_include_persisted_context_window() {
+    let options = ConversationService::augment_qoder_context_window_options(
+        r#"{"backend":"qoder","context_window":400000}"#,
+        &[200_000, 400_000, 1_000_000],
+        vec![AcpConfigOptionDto {
+            id: "model".to_owned(),
+            name: Some("Model".to_owned()),
+            label: None,
+            description: None,
+            category: Some("model".to_owned()),
+            option_type: "select".to_owned(),
+            current_value: Some("dfmodel".to_owned()),
+            options: Vec::new(),
+        }],
+    );
+
+    assert_eq!(options.len(), 2);
+    let context = options
+        .iter()
+        .find(|option| option.id == "context_window")
+        .expect("Qoder context option");
+    assert_eq!(context.current_value.as_deref(), Some("400000"));
+    assert_eq!(
+        context
+            .options
+            .iter()
+            .map(|option| option.value.as_str())
+            .collect::<Vec<_>>(),
+        vec!["default", "200000", "400000", "1000000"]
+    );
+    assert_eq!(context.options[1].label.as_deref(), Some("200K"));
+    assert_eq!(context.options[3].label.as_deref(), Some("1M"));
+}
+
+#[test]
+fn qoder_context_windows_follow_selected_model_catalog() {
+    let catalog = serde_json::json!({
+        "current_model_id": "ultimate",
+        "available_models": [
+            {
+                "id": "ultimate",
+                "available_context_windows": [200000, 400000, 1000000]
+            },
+            {
+                "id": "kmodel",
+                "availableContextWindows": [256000, 256000, 0]
+            }
+        ]
+    })
+    .to_string();
+
+    assert_eq!(
+        crate::service_ops::context_windows_for_model(&catalog, Some("kmodel")),
+        vec![256_000]
+    );
+    assert_eq!(
+        crate::service_ops::context_windows_for_model(&catalog, None),
+        vec![200_000, 400_000, 1_000_000]
+    );
+    assert!(crate::service_ops::context_windows_for_model(&catalog, Some("unknown")).is_empty());
+}
+
+#[test]
+fn qoder_config_options_do_not_guess_windows_when_catalog_is_missing() {
+    let options = ConversationService::augment_qoder_context_window_options(
+        r#"{"backend":"qoder","context_window":128000}"#,
+        &[],
+        Vec::new(),
+    );
+    let context = options
+        .iter()
+        .find(|option| option.id == "context_window")
+        .expect("Qoder context option");
+    assert_eq!(context.current_value.as_deref(), Some("default"));
+    assert_eq!(
+        context
+            .options
+            .iter()
+            .map(|option| option.value.as_str())
+            .collect::<Vec<_>>(),
+        vec!["default"]
+    );
+}
+
 #[tokio::test]
 async fn get_config_options_rejects_cross_user_active_task() {
     let task_mgr = Arc::new(MockTaskManager::new());
@@ -6367,6 +6610,56 @@ async fn startup_recovery_closes_stale_runtime_messages_without_failure_tip() {
         messages.iter().all(|message| message.r#type != "tips"),
         "startup recovery must not write failure tips"
     );
+
+    let recovered_conversation = svc.get("user_1", &conv.id).await.unwrap();
+    assert_eq!(recovered_conversation.status, ConversationStatus::Finished);
+}
+
+#[tokio::test]
+async fn graceful_shutdown_recovery_closes_active_runtime_state_immediately() {
+    let (svc, _broadcaster, repo, _task_mgr) = make_service();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+
+    repo.insert_message(
+        "user_1",
+        &MessageRow {
+            id: "shutdown-tool".into(),
+            conversation_id: conv.id.clone(),
+            msg_id: Some("shutdown-tool".into()),
+            r#type: "tool_call".into(),
+            content: json!({ "call_id": "tool-1", "name": "team_members", "status": "running" }).to_string(),
+            position: Some("left".into()),
+            status: Some("work".into()),
+            hidden: false,
+            created_at: 1,
+            backend_turn_id: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    svc.runtime_state().mark_shutting_down();
+    svc.settle_stale_runtime_state_on_shutdown().await;
+
+    let messages = repo
+        .list_messages_page(
+            "user_1",
+            &conv.id,
+            &MessagePageParams {
+                limit: 20,
+                direction: MessagePageDirection::InitialLatest,
+            },
+        )
+        .await
+        .unwrap()
+        .items;
+    let tool = messages.iter().find(|message| message.id == "shutdown-tool").unwrap();
+    assert_eq!(tool.status.as_deref(), Some("finish"));
+    let tool_content: serde_json::Value = serde_json::from_str(&tool.content).unwrap();
+    assert_eq!(tool_content["status"], "canceled");
+
+    let recovered_conversation = svc.get("user_1", &conv.id).await.unwrap();
+    assert_eq!(recovered_conversation.status, ConversationStatus::Finished);
 }
 
 #[tokio::test]

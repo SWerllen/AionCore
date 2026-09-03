@@ -19,8 +19,21 @@ pub(super) fn apply_acp_launch_policy(command_spec: &mut CommandSpec, input: Acp
         input.metadata,
         initial_mode_from_build_context(input.metadata, input.config, input.session_snapshot).as_deref(),
     );
+    apply_qoder_context_window_arg(command_spec, input.metadata, input.config);
     append_runtime_env(command_spec, input.runtime_env);
     append_claude_provider_env(command_spec, input.metadata);
+}
+
+fn apply_qoder_context_window_arg(command_spec: &mut CommandSpec, metadata: &AgentMetadata, config: &AcpBuildExtra) {
+    if metadata.backend.as_deref() != Some("qoder") {
+        return;
+    }
+    let Some(context_window) = config.context_window.filter(|value| *value > 0) else {
+        return;
+    };
+    command_spec.args.push("--context-window".to_owned());
+    command_spec.args.push(context_window.to_string());
+    tracing::info!(context_window, "Applying persisted Qoder context window");
 }
 
 fn append_runtime_env(command_spec: &mut CommandSpec, runtime_env: &[(String, String)]) {
@@ -227,6 +240,33 @@ mod tests {
                 .iter()
                 .any(|arg| arg == CODEX_WINDOWS_UNELEVATED_SANDBOX)
         );
+    }
+
+    #[test]
+    fn apply_acp_launch_policy_adds_qoder_context_window() {
+        let mut command_spec = CommandSpec {
+            command: "qodercli".into(),
+            args: vec!["--acp".into()],
+            env: vec![],
+            cwd: None,
+        };
+        let metadata = agent_metadata_with_backend(Some("qoder"));
+        let config = AcpBuildExtra {
+            context_window: Some(200_000),
+            ..Default::default()
+        };
+
+        apply_acp_launch_policy(
+            &mut command_spec,
+            AcpLaunchPolicyInput {
+                metadata: &metadata,
+                config: &config,
+                session_snapshot: None,
+                runtime_env: &[],
+            },
+        );
+
+        assert_eq!(command_spec.args, vec!["--acp", "--context-window", "200000"]);
     }
 
     #[test]

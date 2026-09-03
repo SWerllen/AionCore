@@ -4,7 +4,7 @@ use aionui_api_types::TeamToolTransport;
 
 mod wake_summary;
 
-pub use aionui_team_prompts::AvailableAssistant;
+pub use aionui_team_prompts::{AvailableAssistant, AvailableWorkerProfile};
 
 use crate::types::{MailboxMessage, MailboxMessageType, TeamAgent, TeamTask};
 
@@ -163,6 +163,7 @@ mod tests {
             backend: "acp".into(),
             model: "claude".into(),
             assistant_id: None,
+            worker_profile: None,
             status: None,
             conversation_type: None,
             cli_path: None,
@@ -178,6 +179,7 @@ mod tests {
             backend: "acp".into(),
             model: "claude".into(),
             assistant_id: None,
+            worker_profile: None,
             status: None,
             conversation_type: None,
             cli_path: None,
@@ -228,6 +230,7 @@ mod tests {
             backend: "claude".into(),
             description: "Drafts Word documents".into(),
             skills: vec!["docx".into(), "formatting".into()],
+            worker_profiles: vec![],
         }]
     }
 
@@ -257,12 +260,12 @@ mod tests {
         // Workflow uses tools for dynamic state.
         assert!(prompt.contains("## Workflow"));
         assert!(prompt.contains("FIRST call `team_members`"));
-        assert!(prompt.contains("call `team_list_assistants`"));
-        assert!(prompt.contains("Wait for explicit confirmation before using team_spawn_agent"));
-        assert!(prompt.contains("End your turn after the proposal"));
+        assert!(prompt.contains("Call `team_list_assistants`"));
+        assert!(prompt.contains("Do not ask for a separate team-mode confirmation"));
+        assert!(prompt.contains("Call `team_spawn_agent` immediately"));
 
         // Assistant selection, not model selection.
-        assert!(prompt.contains("## Assistant Selection Guidelines"));
+        assert!(prompt.contains("## Worker Selection Guidelines"));
         assert!(!prompt.contains("team_list_models"));
         assert!(prompt.contains("Do not pass a model to `team_spawn_agent`"));
 
@@ -283,7 +286,7 @@ mod tests {
         assert!(prompt.contains("team_members"));
         assert!(prompt.contains("team_task_list"));
         assert!(prompt.contains("team_rename_agent"));
-        assert!(prompt.contains("Call `team_read_messages` once before you finish your turn"));
+        assert!(prompt.contains("Once workers exist, call `team_read_messages`"));
         assert!(prompt.contains("`since_message_id`"));
         assert!(prompt.contains("`content_truncated: true`"));
     }
@@ -310,7 +313,7 @@ mod tests {
         let prompt = build_lead_prompt(&make_lead(), "Solo", &[], &assistants);
         assert!(!prompt.contains("## Your Teammates"));
         assert!(!prompt.contains("(no teammates yet"));
-        assert!(prompt.to_lowercase().contains("first team turn"));
+        assert!(prompt.to_lowercase().contains("first team-capable turn"));
         assert!(prompt.contains("team_members"));
     }
 

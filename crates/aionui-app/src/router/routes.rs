@@ -27,8 +27,9 @@ use aionui_channel::channel_routes;
 #[cfg(feature = "weixin")]
 use aionui_channel::weixin_login_route;
 use aionui_common::ApiErrorLogContext;
-use aionui_conversation::{conversation_ops_routes, conversation_routes};
+use aionui_conversation::{conversation_ops_routes, conversation_routes, steward_routes};
 use aionui_cron::cron_routes;
+use aionui_db::SqliteAcpSessionRepository;
 use aionui_extension::{extension_routes, hub_routes, skill_routes};
 use aionui_file::file_routes;
 use aionui_mcp::mcp_routes;
@@ -40,6 +41,7 @@ use aionui_sidebar::sidebar_routes;
 use aionui_system::{ClientPrefService, connection_test_routes, system_routes};
 use aionui_team::{TeamSessionService, team_routes};
 
+use crate::local_history::{LocalHistoryRouterState, local_history_routes};
 use crate::services::AppServices;
 
 use super::fs_monitor::spawn_fs_monitor;
@@ -49,7 +51,7 @@ use aionui_skill_runtime::skill_runtime_routes;
 
 use super::runtime_team_tools::{RuntimeTeamToolsState, runtime_team_tools_routes};
 use super::scm_monitor::{CompositeMessageRouter, spawn_scm_monitor};
-use super::state::{ModuleStates, RouterBuildError, build_module_states, build_ws_state};
+use super::state::{ModuleStates, RouterBuildError, StewardReportDeliveryAdapter, build_module_states, build_ws_state};
 use super::trace::with_access_log;
 
 pub struct RouterRuntime {
@@ -120,6 +122,13 @@ pub async fn create_router_with_runtime(services: &AppServices) -> Result<(Route
     let team_service = states.team.service.clone();
     tracing::info!(elapsed_ms = boot.elapsed().as_millis(), "startup: module states built");
 
+    let steward_report_service = states.conversation.steward.clone();
+    steward_report_service.set_report_delivery_port(Arc::new(StewardReportDeliveryAdapter {
+        manager: channel_components.manager.clone(),
+        repo: states.channel.repo.clone(),
+    }));
+    spawn_steward_report_watcher(services.event_bus.subscribe(), steward_report_service);
+
     // Start channel orchestrator (message loop)
     tokio::spawn(
         channel_components
@@ -186,6 +195,55 @@ pub async fn create_router_with_runtime(services: &AppServices) -> Result<(Route
             team_service,
         },
     ))
+}
+
+fn spawn_steward_report_watcher(
+    mut event_rx: tokio::sync::broadcast::Receiver<WebSocketMessage<serde_json::Value>>,
+    steward: aionui_conversation::StewardService,
+) {
+    let (terminal_tx, mut terminal_rx) = tokio::sync::mpsc::channel::<WebSocketMessage<serde_json::Value>>(64);
+
+    tokio::spawn(async move {
+        loop {
+            match event_rx.recv().await {
+                Ok(event)
+                    if matches!(
+                        event.name.as_str(),
+                        "turn.completed" | "team.runCompleted" | "team.runFailed" | "team.runCancelled"
+                    ) =>
+                {
+                    if terminal_tx.send(event).await.is_err() {
+                        break;
+                    }
+                }
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    tracing::warn!(skipped, "steward report event watcher lagged");
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+
+    tokio::spawn(async move {
+        let mut retry_tick = tokio::time::interval(std::time::Duration::from_secs(5));
+        retry_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                maybe_event = terminal_rx.recv() => {
+                    let Some(event) = maybe_event else { break; };
+                    if let Err(error) = steward.handle_terminal_event(&event.name, &event.data).await {
+                        tracing::error!(event_name = %event.name, error = %error, "steward terminal event handling failed");
+                    }
+                }
+                _ = retry_tick.tick() => {
+                    if let Err(error) = steward.deliver_pending_reports().await {
+                        tracing::warn!(error = %error, "steward report outbox drain failed");
+                    }
+                }
+            }
+        }
+    });
 }
 
 /// Create the application router with custom module states.
@@ -274,12 +332,23 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         })),
     };
 
+    let local_history_state = LocalHistoryRouterState::new(
+        services.database.pool().clone(),
+        services.conversation_service.clone(),
+        services.conversation_repo.clone(),
+        Arc::new(SqliteAcpSessionRepository::new(services.database.pool().clone())),
+        services.project_service.clone(),
+    );
+
     // System routes protected by auth middleware
     let system_authenticated =
         system_routes(states.system).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
     // Conversation routes protected by auth middleware
     let conversation_authenticated = conversation_routes(states.conversation.clone())
+        .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+
+    let steward_authenticated = steward_routes(states.conversation.clone())
         .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
     let conversation_ops_authenticated = conversation_ops_routes(states.conversation)
@@ -304,6 +373,9 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     // Project control-plane routes protected by auth middleware
     let project_authenticated =
         project_routes(states.project).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+
+    let local_history_authenticated = local_history_routes(local_history_state)
+        .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
     // Sidebar read + ordering routes protected by auth middleware
     let sidebar_authenticated =
@@ -393,12 +465,14 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         .merge(auth_routes(auth_state))
         .merge(system_authenticated)
         .merge(conversation_authenticated)
+        .merge(steward_authenticated)
         .merge(conversation_ops_authenticated)
         .merge(remote_agent_authenticated)
         .merge(agent_authenticated)
         .merge(connection_test_authenticated)
         .merge(file_authenticated)
         .merge(project_authenticated)
+        .merge(local_history_authenticated)
         .merge(sidebar_authenticated)
         .merge(mcp_authenticated)
         .merge(extension_authenticated)

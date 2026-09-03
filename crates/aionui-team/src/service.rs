@@ -837,6 +837,228 @@ impl TeamSessionService {
         self.build_team_response(user_id, &team).await
     }
 
+    /// Attach a latent one-member Team to an already-created normal
+    /// conversation. The conversation remains the product-level session and
+    /// leader; only workers created later receive Team-owned conversations.
+    pub async fn ensure_embedded_team_for_conversation(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<String, TeamError> {
+        let lock_key = format!("embedded:{conversation_id}");
+        let lock = self
+            .add_agent_locks
+            .entry(lock_key.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _guard = lock.lock().await;
+
+        if let Some(binding) = self
+            .conversation_port
+            .lookup_team_binding_by_conversation(conversation_id)
+            .await?
+            && binding.user_id == user_id
+            && let Some(team_id) = binding.team_id
+        {
+            self.load_owned_team(user_id, &team_id).await?;
+            return Ok(team_id);
+        }
+
+        let leader = self
+            .conversation_port
+            .existing_conversation_leader(user_id, conversation_id)
+            .await?;
+        if leader.conversation_id != conversation_id {
+            return Err(TeamError::InvalidRequest(
+                "existing conversation leader resolver returned a mismatched id".to_owned(),
+            ));
+        }
+
+        let team_id = generate_id();
+        let slot_id = generate_id();
+        let now = now_ms();
+        let agents = vec![TeamAgent {
+            slot_id: slot_id.clone(),
+            name: leader.name.clone(),
+            role: TeammateRole::Lead,
+            conversation_id: leader.conversation_id.clone(),
+            backend: leader.backend.clone(),
+            model: leader.model.clone(),
+            assistant_id: leader.assistant_id.clone(),
+            worker_profile: None,
+            status: None,
+            conversation_type: None,
+            cli_path: None,
+        }];
+        let agents_json = serde_json::to_string(&agents)?;
+        let (project_id, folder_id) = self.resolve_binding_best_effort(user_id, &leader.workspace).await;
+        self.repo
+            .create_team(&TeamRow {
+                id: team_id.clone(),
+                user_id: user_id.to_owned(),
+                name: leader.name.clone(),
+                workspace: leader.workspace.clone(),
+                workspace_mode: "shared".to_owned(),
+                agents: agents_json,
+                lead_agent_id: Some(slot_id.clone()),
+                session_mode: None,
+                agents_version: "1.0.1".to_owned(),
+                created_at: now,
+                updated_at: now,
+                project_id,
+                folder_id,
+            })
+            .await?;
+
+        if let Err(error) = self
+            .conversation_port
+            .patch_runtime_config(
+                conversation_id,
+                serde_json::json!({
+                    "embedded_team_id": team_id,
+                    "embedded_team": true,
+                    "slot_id": slot_id,
+                    "role": "lead",
+                }),
+            )
+            .await
+        {
+            if let Err(cleanup_error) = self.repo.delete_team(user_id, &team_id).await {
+                warn!(
+                    team_id,
+                    conversation_id,
+                    error = %cleanup_error,
+                    "embedded team binding rollback could not delete team row"
+                );
+            }
+            return Err(error);
+        }
+
+        info!(
+            team_id,
+            slot_id,
+            conversation_id,
+            backend = %leader.backend,
+            assistant_id = %leader.assistant_id.as_deref().unwrap_or(""),
+            "Normal conversation bound as embedded Team leader"
+        );
+        self.add_agent_locks.remove(&lock_key);
+        Ok(team_id)
+    }
+
+    /// Refresh the persisted leader roster after its ordinary conversation
+    /// changes Assistant providers. Team sessions capture the roster when they
+    /// are built, so the old session and every member runtime are stopped first;
+    /// the next ensure rebuilds the same team with the new leader identity.
+    pub async fn sync_embedded_leader_identity(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        leader_conversation_id: &str,
+    ) -> Result<(), TeamError> {
+        let lock = self
+            .add_agent_locks
+            .entry(team_id.to_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _guard = lock.lock().await;
+        let mut team = self.load_owned_team(user_id, team_id).await?;
+        let fresh = self
+            .conversation_port
+            .existing_conversation_leader(user_id, leader_conversation_id)
+            .await?;
+        let (backend, assistant_id) = {
+            let leader = team
+                .agents
+                .iter_mut()
+                .find(|agent| agent.role == TeammateRole::Lead && agent.conversation_id == leader_conversation_id)
+                .ok_or_else(|| {
+                    TeamError::InvalidRequest(
+                        "embedded team leader does not match the conversation being switched".to_owned(),
+                    )
+                })?;
+            leader.backend = fresh.backend;
+            leader.model = fresh.model;
+            leader.assistant_id = fresh.assistant_id;
+            (leader.backend.clone(), leader.assistant_id.clone())
+        };
+
+        self.stop_team_runtime_and_agents(team_id, &team, AgentKillReason::RuntimeRestart)
+            .await;
+        self.repo
+            .update_team(
+                user_id,
+                team_id,
+                &UpdateTeamParams {
+                    agents: Some(serde_json::to_string(&team.agents)?),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        info!(
+            team_id,
+            conversation_id = leader_conversation_id,
+            backend,
+            assistant_id = %assistant_id.as_deref().unwrap_or(""),
+            "Embedded team leader identity synchronized"
+        );
+        Ok(())
+    }
+
+    /// Delete an embedded team's workers and coordination state while leaving
+    /// its normal leader conversation for the caller to delete exactly once.
+    pub async fn remove_embedded_team_for_leader(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        leader_conversation_id: &str,
+    ) -> Result<(), TeamError> {
+        let team = self.load_owned_team(user_id, team_id).await?;
+        let leader_matches = team
+            .agents
+            .iter()
+            .any(|agent| agent.role == TeammateRole::Lead && agent.conversation_id == leader_conversation_id);
+        if !leader_matches {
+            return Err(TeamError::InvalidRequest(
+                "embedded team leader does not match the conversation being deleted".to_owned(),
+            ));
+        }
+
+        self.stop_team_runtime_and_agents(team_id, &team, AgentKillReason::TeamDeleted)
+            .await;
+        for agent in team
+            .agents
+            .iter()
+            .filter(|agent| agent.conversation_id != leader_conversation_id)
+        {
+            if let Err(error) = self
+                .conversation_port
+                .delete_team_conversation(user_id, &agent.conversation_id)
+                .await
+            {
+                warn!(
+                    team_id,
+                    slot_id = %agent.slot_id,
+                    conversation_id = %agent.conversation_id,
+                    error = %error,
+                    "embedded team worker conversation cleanup failed"
+                );
+            }
+        }
+        self.repo.delete_mailbox_by_team(user_id, team_id).await?;
+        self.repo.delete_tasks_by_team(user_id, team_id).await?;
+        self.repo.delete_team(user_id, team_id).await?;
+        self.remove_team_order_row(user_id, team_id).await;
+        self.add_agent_locks.remove(team_id);
+        self.add_agent_locks
+            .remove(&format!("embedded:{leader_conversation_id}"));
+        info!(
+            team_id,
+            leader_conversation_id, "Embedded Team removed with leader conversation"
+        );
+        Ok(())
+    }
+
     pub async fn list_teams(&self, user_id: &str) -> Result<Vec<TeamResponse>, TeamError> {
         let rows = self.repo.list_teams_by_user(user_id).await?;
         let mut teams = Vec::with_capacity(rows.len());
@@ -1665,12 +1887,17 @@ impl TeamSessionService {
                 session.scheduler().add_agent(agent).await;
             }
             let snapshot = session.member_runtimes().snapshot(&agent.slot_id);
-            // Skip dormant teammates: an Absent non-lead member was never
-            // triggered, so a re-ensure (second warmupSession, model switch,
-            // retry) must NOT wake it, or it would punch through lazy warmup
-            // (spec 5.1). The leader, Ready-repair, Failed-retry, and in-flight
-            // members still reconcile.
-            if matches!(snapshot, MemberRuntimeSnapshot::Absent) && agent.role != TeammateRole::Lead {
+            // Skip dormant and already-failed teammates. A whole-team ensure is
+            // called by page mounts, config changes, and send preparation; it
+            // must neither punch through lazy warmup nor turn a deterministic
+            // startup failure into a hot retry loop. Failed members remain
+            // inline until a directed retry/replacement/removal is requested.
+            // Leaders and Ready-repair/in-flight members still reconcile.
+            if matches!(
+                snapshot,
+                MemberRuntimeSnapshot::Absent | MemberRuntimeSnapshot::Failed { .. }
+            ) && agent.role != TeammateRole::Lead
+            {
                 continue;
             }
             let reservation = match snapshot {
@@ -1733,7 +1960,7 @@ impl TeamSessionService {
     ) -> Result<(), TeamError> {
         // Session-level `Starting` is leader-scoped (spec 5.4/5.5): only a
         // leader (re)attach may raise the overlay. Reconciliation that touches
-        // only teammates (Ready-repair, Failed-retry of a non-lead member) keeps
+        // only teammates (Ready-repair of a non-lead member) keeps
         // its progress inline via `agentRuntimeStatusChanged`.
         if work.iter().any(|item| item.agent.role == TeammateRole::Lead) {
             self.publish_member_runtime_starting_if_current(&session);

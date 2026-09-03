@@ -28,15 +28,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use aionui_process::Spawner;
 use serde_json::{Value, json};
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::{Mutex, broadcast, oneshot};
 
 #[cfg(any(test, feature = "test-support"))]
 use super::codex_title::NoTitleIo;
 use super::codex_title::{SpawnedTitleIo, TitleGen};
 use super::suspend::{ProcHandle, SuspendController, spawn_idle_timer};
 use super::types::{
-    Admission, BackendError, CancelTarget, Command, CommandReceipt, ContentBlock, PendingPermissionView,
-    SessionEnvelope, SessionSpec,
+    Admission, BackendError, CancelTarget, Command, CommandReceipt, ContentBlock, NativeGoal, NativeGoalUpdate,
+    PendingPermissionView, SessionEnvelope, SessionSpec,
 };
 use super::{BackendConnection, SessionBackend, SessionConfig};
 use crate::adapter::AgentIo;
@@ -785,6 +785,9 @@ fn builtin_slash_commands() -> Vec<crate::capability::SlashCommandInfo> {
 /// §6.2); 5s is orders of magnitude of headroom while keeping a wedged pipe
 /// from blocking the send path indefinitely.
 const STEER_ACK_TIMEOUT_MS: u64 = 5_000;
+/// Provider control RPCs are local app-server bookkeeping and normally answer
+/// in milliseconds. Bound the wait so a dead process cannot hang an HTTP call.
+const CONTROL_RPC_TIMEOUT_MS: u64 = 10_000;
 
 /// Per-session codex handle. `&self`-concurrent (stdin write behind a Mutex).
 pub struct CodexSessionBackend {
@@ -909,6 +912,11 @@ pub struct CodexSessionBackend {
     /// rejects with a bare -32600 whose MESSAGE is the only discriminator,
     /// §6甲.1).
     pending_steers: Arc<Mutex<HashMap<u64, PendingSteer>>>,
+    /// Narrow synchronous control-plane correlation used by provider-owned
+    /// state such as `thread/goal/*`. Unlike prompt/steer correlations this has
+    /// no turn lifecycle side effects: the reader only returns the JSON-RPC
+    /// result/error to the waiting caller.
+    pending_control_requests: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>,
     /// How long dispatch(Steer) waits for the ack before degrading to
     /// fire-and-forget (Ok + warn). Milliseconds; injectable for tests.
     steer_ack_timeout_ms: AtomicU64,
@@ -1005,6 +1013,7 @@ struct CodexReaderState {
     pending_discovery: Arc<Mutex<HashMap<u64, DiscoveryKind>>>,
     pending_set: Arc<Mutex<HashMap<u64, String>>>,
     pending_steers: Arc<Mutex<HashMap<u64, PendingSteer>>>,
+    pending_control_requests: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>,
     pending_resume: Arc<Mutex<Option<u64>>>,
     resume_poison: Arc<Mutex<Option<String>>>,
     pending_fork: Arc<Mutex<Option<u64>>>,
@@ -1043,6 +1052,7 @@ fn start_codex_reader(
             state.pending_discovery,
             state.pending_set,
             state.pending_steers,
+            state.pending_control_requests,
             state.pending_resume,
             state.resume_poison,
             state.pending_fork,
@@ -1254,6 +1264,7 @@ impl CodexSessionBackend {
         let pending_discovery = Arc::new(Mutex::new(HashMap::new()));
         let pending_set = Arc::new(Mutex::new(HashMap::new()));
         let pending_steers = Arc::new(Mutex::new(HashMap::new()));
+        let pending_control_requests = Arc::new(Mutex::new(HashMap::new()));
         let pending_resume = Arc::new(Mutex::new(None));
         let resume_poison = Arc::new(Mutex::new(None));
         let pending_fork = Arc::new(Mutex::new(None));
@@ -1279,6 +1290,7 @@ impl CodexSessionBackend {
             pending_discovery: pending_discovery.clone(),
             pending_set: pending_set.clone(),
             pending_steers: pending_steers.clone(),
+            pending_control_requests: pending_control_requests.clone(),
             pending_resume: pending_resume.clone(),
             resume_poison: resume_poison.clone(),
             pending_fork: pending_fork.clone(),
@@ -1338,6 +1350,7 @@ impl CodexSessionBackend {
             pending_discovery,
             pending_set,
             pending_steers,
+            pending_control_requests,
             pending_resume,
             resume_poison,
             pending_fork,
@@ -1368,6 +1381,42 @@ impl CodexSessionBackend {
 
     fn next_rpc_id(&self) -> u64 {
         self.rpc_id.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// Execute one non-turn JSON-RPC request over the already-running Codex
+    /// app-server. The reader owns stdout, so the response is correlated through
+    /// a oneshot instead of trying to read from the process in the HTTP task.
+    async fn control_request(&self, method: &'static str, params: Value) -> Result<Value, BackendError> {
+        self.suspend
+            .ensure_awake(aionui_common::now_ms(), || self.wake_handle())
+            .await?;
+        let id = self.next_rpc_id();
+        let (tx, rx) = oneshot::channel();
+        self.pending_control_requests.lock().await.insert(id, tx);
+        let frame = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        });
+        if let Err(error) = self.write_frame(frame).await {
+            self.pending_control_requests.lock().await.remove(&id);
+            return Err(error);
+        }
+        tracing::debug!(backend = "codex", method, "provider control request sent");
+        match tokio::time::timeout(std::time::Duration::from_millis(CONTROL_RPC_TIMEOUT_MS), rx).await {
+            Ok(Ok(Ok(result))) => Ok(result),
+            Ok(Ok(Err(message))) => Err(BackendError::Transport(format!("codex {method} rejected: {message}"))),
+            Ok(Err(_closed)) => Err(BackendError::Transport(format!(
+                "codex {method} response channel closed"
+            ))),
+            Err(_elapsed) => {
+                self.pending_control_requests.lock().await.remove(&id);
+                Err(BackendError::Transport(format!(
+                    "codex {method} timed out after {CONTROL_RPC_TIMEOUT_MS}ms"
+                )))
+            }
+        }
     }
 
     /// Resolve the bound backend threadId, waiting briefly for the async
@@ -1593,6 +1642,7 @@ async fn reader_task(
     pending_discovery: Arc<Mutex<HashMap<u64, DiscoveryKind>>>,
     pending_set: Arc<Mutex<HashMap<u64, String>>>,
     pending_steers: Arc<Mutex<HashMap<u64, PendingSteer>>>,
+    pending_control_requests: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>,
     pending_resume: Arc<Mutex<Option<u64>>>,
     resume_poison: Arc<Mutex<Option<String>>>,
     pending_fork: Arc<Mutex<Option<u64>>>,
@@ -1897,6 +1947,19 @@ async fn reader_task(
                                     .unwrap_or("request rejected (no error message)")
                                     .to_string()
                             });
+                            // Provider control plane: return the synchronous
+                            // result/error to its HTTP caller without touching
+                            // prompt admission, turn state, or user-visible events.
+                            if let Some(waiter) = pending_control_requests.lock().await.remove(&rid) {
+                                let response = match frame.get("result") {
+                                    Some(result) => Ok(result.clone()),
+                                    None => Err(error_message
+                                        .clone()
+                                        .unwrap_or_else(|| "request rejected (no result or error message)".into())),
+                                };
+                                let _ = waiter.send(response);
+                                continue;
+                            }
                             // (ELECTRON-3Q0 fix A) Claim the thread/resume response.
                             // An ERROR ("no rollout found for thread id …", verified:
                             // samples/codex-cli/0.144.1/dead_resume.jsonl) means the
@@ -3879,6 +3942,62 @@ fn extract_http_status_from_message(message: &str) -> Option<u64> {
 
 #[async_trait::async_trait]
 impl SessionBackend for CodexSessionBackend {
+    fn provider_name(&self) -> &'static str {
+        "codex"
+    }
+
+    async fn native_goal_get(&self) -> Result<Option<NativeGoal>, BackendError> {
+        let thread_id = self.bound_thread().await?;
+        let result = self
+            .control_request("thread/goal/get", json!({ "threadId": thread_id }))
+            .await?;
+        let value = result
+            .get("goal")
+            .cloned()
+            .ok_or_else(|| BackendError::Transport("codex thread/goal/get response omitted goal".into()))?;
+        serde_json::from_value(value)
+            .map_err(|error| BackendError::Transport(format!("invalid codex thread/goal/get response: {error}")))
+    }
+
+    async fn native_goal_set(&self, update: NativeGoalUpdate) -> Result<NativeGoal, BackendError> {
+        let thread_id = self.bound_thread().await?;
+        let mut params = serde_json::Map::new();
+        params.insert("threadId".into(), Value::String(thread_id));
+        if let Some(objective) = update.objective {
+            params.insert("objective".into(), Value::String(objective));
+        }
+        if let Some(status) = update.status {
+            params.insert(
+                "status".into(),
+                serde_json::to_value(status).map_err(|error| BackendError::Transport(error.to_string()))?,
+            );
+        }
+        if let Some(token_budget) = update.token_budget {
+            params.insert(
+                "tokenBudget".into(),
+                token_budget.map(Value::from).unwrap_or(Value::Null),
+            );
+        }
+        let result = self.control_request("thread/goal/set", Value::Object(params)).await?;
+        let value = result
+            .get("goal")
+            .cloned()
+            .ok_or_else(|| BackendError::Transport("codex thread/goal/set response omitted goal".into()))?;
+        serde_json::from_value(value)
+            .map_err(|error| BackendError::Transport(format!("invalid codex thread/goal/set response: {error}")))
+    }
+
+    async fn native_goal_clear(&self) -> Result<bool, BackendError> {
+        let thread_id = self.bound_thread().await?;
+        let result = self
+            .control_request("thread/goal/clear", json!({ "threadId": thread_id }))
+            .await?;
+        result
+            .get("cleared")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| BackendError::Transport("invalid codex thread/goal/clear response".into()))
+    }
+
     /// Force-kill path (`UserCancelTimeout`): delegate to the suspend
     /// controller's unconditional teardown (abort reader → group-kill the codex
     /// CLI process tree), so the process dies even while an orchestrator still
@@ -6396,6 +6515,132 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
         String::new()
+    }
+
+    #[tokio::test]
+    async fn native_goal_get_uses_existing_app_server_and_parses_provider_state() {
+        let prefix = concat!(
+            r#"{"jsonrpc":"2.0","method":"thread/started","params":{"thread":{"id":"thread-goal"}}}"#,
+            "\n"
+        )
+        .as_bytes()
+        .to_vec();
+        let response = concat!(
+            r#"{"jsonrpc":"2.0","id":1,"result":{"goal":{"threadId":"thread-goal","objective":"Ship native goal","status":"usageLimited","tokenBudget":12000,"tokensUsed":300,"timeUsedSeconds":12,"createdAt":1,"updatedAt":2}}}"#,
+            "\n"
+        )
+        .as_bytes()
+        .to_vec();
+        let fake = FakeAgentIo::never_exits(prefix).with_gated_segments(vec![response]);
+        let release = fake.segment_releaser();
+        let captured = fake.captured_stdin();
+        let backend = Arc::new(CodexSessionBackend::build_with_io("codex-goal", Box::new(fake)).await);
+
+        let request = {
+            let backend = backend.clone();
+            tokio::spawn(async move { backend.native_goal_get().await })
+        };
+        let written = captured_str(&captured).await;
+        assert!(written.contains(r#""method":"thread/goal/get""#), "got: {written}");
+        assert!(written.contains(r#""threadId":"thread-goal""#), "got: {written}");
+        release();
+
+        let goal = tokio::time::timeout(std::time::Duration::from_secs(1), request)
+            .await
+            .expect("goal get timed out")
+            .expect("goal task panicked")
+            .expect("goal get failed")
+            .expect("goal missing");
+        assert_eq!(backend.provider_name(), "codex");
+        assert_eq!(goal.objective, "Ship native goal");
+        assert_eq!(goal.status, super::super::types::NativeGoalStatus::UsageLimited);
+        assert_eq!(goal.token_budget, Some(12_000));
+        assert_eq!(goal.tokens_used, 300);
+    }
+
+    #[tokio::test]
+    async fn native_goal_set_forwards_partial_update_and_explicit_budget_clear() {
+        let prefix = concat!(
+            r#"{"jsonrpc":"2.0","method":"thread/started","params":{"thread":{"id":"thread-goal"}}}"#,
+            "\n"
+        )
+        .as_bytes()
+        .to_vec();
+        let response = concat!(
+            r#"{"jsonrpc":"2.0","id":1,"result":{"goal":{"threadId":"thread-goal","objective":"Updated","status":"paused","tokenBudget":null,"tokensUsed":5,"timeUsedSeconds":2,"createdAt":1,"updatedAt":3}}}"#,
+            "\n"
+        )
+        .as_bytes()
+        .to_vec();
+        let fake = FakeAgentIo::never_exits(prefix).with_gated_segments(vec![response]);
+        let release = fake.segment_releaser();
+        let captured = fake.captured_stdin();
+        let backend = Arc::new(CodexSessionBackend::build_with_io("codex-goal", Box::new(fake)).await);
+
+        let request = {
+            let backend = backend.clone();
+            tokio::spawn(async move {
+                backend
+                    .native_goal_set(NativeGoalUpdate {
+                        objective: Some("Updated".into()),
+                        status: Some(super::super::types::NativeGoalStatus::Paused),
+                        token_budget: Some(None),
+                    })
+                    .await
+            })
+        };
+        let written = captured_str(&captured).await;
+        assert!(written.contains(r#""method":"thread/goal/set""#), "got: {written}");
+        assert!(written.contains(r#""objective":"Updated""#), "got: {written}");
+        assert!(written.contains(r#""status":"paused""#), "got: {written}");
+        assert!(written.contains(r#""tokenBudget":null"#), "got: {written}");
+        release();
+
+        let goal = tokio::time::timeout(std::time::Duration::from_secs(1), request)
+            .await
+            .expect("goal set timed out")
+            .expect("goal task panicked")
+            .expect("goal set failed");
+        assert_eq!(goal.status, super::super::types::NativeGoalStatus::Paused);
+        assert_eq!(goal.token_budget, None);
+    }
+
+    #[tokio::test]
+    async fn native_goal_clear_returns_provider_rejection_instead_of_hanging() {
+        let prefix = concat!(
+            r#"{"jsonrpc":"2.0","method":"thread/started","params":{"thread":{"id":"thread-goal"}}}"#,
+            "\n"
+        )
+        .as_bytes()
+        .to_vec();
+        let response = concat!(
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"goal store unavailable"}}"#,
+            "\n"
+        )
+        .as_bytes()
+        .to_vec();
+        let fake = FakeAgentIo::never_exits(prefix).with_gated_segments(vec![response]);
+        let release = fake.segment_releaser();
+        let captured = fake.captured_stdin();
+        let backend = Arc::new(CodexSessionBackend::build_with_io("codex-goal", Box::new(fake)).await);
+
+        let request = {
+            let backend = backend.clone();
+            tokio::spawn(async move { backend.native_goal_clear().await })
+        };
+        let written = captured_str(&captured).await;
+        assert!(written.contains(r#""method":"thread/goal/clear""#), "got: {written}");
+        release();
+
+        let error = tokio::time::timeout(std::time::Duration::from_secs(1), request)
+            .await
+            .expect("goal clear timed out")
+            .expect("goal task panicked")
+            .expect_err("provider rejection must fail");
+        assert!(
+            matches!(error, BackendError::Transport(message) if message.contains("goal store unavailable")),
+            "provider error must be preserved"
+        );
     }
 
     #[tokio::test]

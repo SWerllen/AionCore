@@ -268,7 +268,15 @@ async fn run_probe(
                 Some(error),
             ),
             Ok(args) => {
-                match custom_agent_probe::try_connect_custom_agent_with_catalog(command, &args, &env, None).await {
+                let probe = if meta.backend.as_deref() == Some("qoder") {
+                    custom_agent_probe::try_connect_custom_agent_with_model_reasoning_catalog(
+                        command, &args, &env, None,
+                    )
+                    .await
+                } else {
+                    custom_agent_probe::try_connect_custom_agent_with_catalog(command, &args, &env, None).await
+                };
+                match probe {
                     // The probe opened a real session to reach this verdict, so its
                     // `session/new` already carried whatever modes / models / config
                     // options the agent advertises. Persist them through the same

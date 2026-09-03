@@ -1051,6 +1051,7 @@ async fn exec_spawn_agent(
     let req = SpawnAgentRequest {
         name: requested_name.clone(),
         assistant_id: Some(assistant_id),
+        worker_profile_id: Some(input.worker_profile_id),
     };
 
     let service = service

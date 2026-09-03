@@ -22,9 +22,12 @@ pub mod skill_resolver;
 pub mod skill_snapshot;
 mod startup_recovery;
 pub mod state;
+mod steward;
+mod steward_routes;
 mod stream_persistence;
 pub mod stream_relay;
 pub mod task_options;
+mod team_orchestrator;
 mod turn_continuation_policy;
 mod turn_orchestrator;
 mod turn_recovery_policy;
@@ -40,6 +43,9 @@ pub use service::{
     ConversationAgentTurnStartedCallback, ConversationAgentTurnStatus, ConversationService,
 };
 pub use state::ConversationRouterState;
+pub use steward::{StewardArchiveTarget, StewardControlPort, StewardReportDeliveryPort, StewardService};
+pub use steward_routes::steward_routes;
+pub use team_orchestrator::{ConversationTeamOrchestrator, EmbeddedTeamSendResult};
 
 #[cfg(test)]
 #[path = "service_test.rs"]

@@ -260,6 +260,7 @@ pub(super) fn message_to_unified(msg: &MessageCreate, bot_user_id: &str) -> Opti
         id: msg.id.clone(),
         platform: PluginType::Discord,
         chat_id: msg.channel_id.clone(),
+        is_group: !is_dm,
         user: UnifiedUser {
             id: msg.author.id.clone(),
             username: msg.author.username.clone(),

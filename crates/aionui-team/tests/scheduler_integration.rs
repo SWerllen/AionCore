@@ -50,6 +50,7 @@ fn make_agent(slot_id: &str, name: &str, role: TeammateRole) -> TeamAgent {
         backend: "acp".into(),
         model: "claude".into(),
         assistant_id: None,
+        worker_profile: None,
         status: None,
         conversation_type: None,
         cli_path: None,

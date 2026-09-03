@@ -63,6 +63,11 @@ pub struct ForkSpec {
 /// ACP-specific fields extracted from `extra` in build task options.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AcpBuildExtra {
+    /// Marks the single personal-steward conversation. The ACP factory uses
+    /// this server-owned flag to preserve the steward control MCP while still
+    /// suppressing ordinary AionUi MCPs for native-harness agents.
+    #[serde(default)]
+    pub steward: bool,
     #[serde(default)]
     pub agent_id: Option<String>,
     #[serde(default)]
@@ -85,6 +90,11 @@ pub struct AcpBuildExtra {
     pub current_model_id: Option<String>,
     #[serde(default)]
     pub thought_level: Option<String>,
+    /// Qoder's native context-window override. Qoder supports this as a CLI
+    /// launch flag but does not currently publish it through ACP config
+    /// options, so AionUi persists the value and applies it on runtime start.
+    #[serde(default)]
+    pub context_window: Option<u64>,
     #[serde(default)]
     pub cron_job_id: Option<String>,
     #[serde(default)]
@@ -181,6 +191,12 @@ mod tests {
     fn acp_build_extra_parses_thought_level_seed() {
         let parsed: AcpBuildExtra = serde_json::from_str(r#"{"backend":"codex","thought_level":"high"}"#).unwrap();
         assert_eq!(parsed.thought_level.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn acp_build_extra_parses_context_window_seed() {
+        let parsed: AcpBuildExtra = serde_json::from_str(r#"{"backend":"qoder","context_window":200000}"#).unwrap();
+        assert_eq!(parsed.context_window, Some(200_000));
     }
 
     #[test]

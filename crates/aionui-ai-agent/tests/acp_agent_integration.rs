@@ -59,6 +59,7 @@ async fn make_mock_agent(script: &str, backend: &str) -> (Arc<AcpAgentManager>, 
     }
 
     let config = aionui_ai_agent::AcpBuildExtra {
+        steward: false,
         agent_id: None,
         backend: Some(backend.to_owned()),
         cli_path: Some(script_path.to_string_lossy().into_owned()),
@@ -70,6 +71,7 @@ async fn make_mock_agent(script: &str, backend: &str) -> (Arc<AcpAgentManager>, 
         session_mode: None,
         current_model_id: None,
         thought_level: None,
+        context_window: None,
         cron_job_id: None,
         team_mcp_stdio_config: None,
         mcp_server_ids: None,

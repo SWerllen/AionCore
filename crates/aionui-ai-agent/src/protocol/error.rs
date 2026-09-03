@@ -318,6 +318,10 @@ impl AcpError {
             ErrorCode::InvalidParams => {
                 if let Some(sid) = extract_session_not_found(err.data.as_ref()) {
                     AcpError::SessionNotFound { session_id: sid }
+                } else if is_session_load_method(context)
+                    && let Some(sid) = extract_invalid_session_identifier(&err.message)
+                {
+                    AcpError::SessionNotFound { session_id: sid }
                 } else {
                     AcpError::InvalidParams { message: err.message }
                 }
@@ -357,6 +361,21 @@ impl AcpError {
 
 fn is_session_load_method(context: &str) -> bool {
     context == "session/load"
+}
+
+/// Qoder reports a missing persisted session as InvalidParams with no data
+/// object and the identifier embedded in the message. Keep this deliberately
+/// narrow and only call it for `session/load`: a malformed prompt/config
+/// request must never erase a valid resume anchor.
+///
+/// Verified against the real Qoder CLI ACP response captured in
+/// `.aionui-runtime/data/logs/2026/09/02/2026-09-02.aioncore.log`.
+fn extract_invalid_session_identifier(message: &str) -> Option<String> {
+    const PREFIX: &str = "Invalid session identifier \"";
+    let rest = message.strip_prefix(PREFIX)?;
+    let end = rest.find('"')?;
+    let session_id = rest[..end].trim();
+    (!session_id.is_empty()).then(|| session_id.to_owned())
 }
 
 /// If `data` carries a `{"error": "Session not found: <sid>"}` payload
@@ -655,6 +674,29 @@ mod tests {
             }
             other => panic!("expected SessionNotFound, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn from_sdk_qoder_invalid_session_identifier_during_load_is_session_not_found() {
+        let mut sdk_err = SdkError::invalid_params();
+        sdk_err.message =
+            "Invalid session identifier \"3cde9a59-491b-4be2-bd3f-473c73cd0789\".\n  Searched current project"
+                .to_owned();
+        let acp = AcpError::from_sdk(sdk_err, "session/load");
+        match acp {
+            AcpError::SessionNotFound { session_id } => {
+                assert_eq!(session_id, "3cde9a59-491b-4be2-bd3f-473c73cd0789");
+            }
+            other => panic!("expected SessionNotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn from_sdk_qoder_invalid_session_identifier_outside_load_stays_invalid_params() {
+        let mut sdk_err = SdkError::invalid_params();
+        sdk_err.message = "Invalid session identifier \"session-1\".".to_owned();
+        let acp = AcpError::from_sdk(sdk_err, "session/set_config_option");
+        assert!(matches!(acp, AcpError::InvalidParams { .. }));
     }
 
     /// Object-shaped data should also be recognised — some agents skip the

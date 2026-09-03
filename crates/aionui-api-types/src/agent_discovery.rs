@@ -61,6 +61,38 @@ pub struct AgentSourceInfo {
 /// to be hardcoded per `AcpBackend`; new keys are added by extending
 /// this struct — we deliberately avoid a free-form "extra" bag so every
 /// flag is type-checked at its usage sites.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillPolicy {
+    /// AionUi resolves the conversation skill snapshot and delivers it to the
+    /// agent through the declared delivery mode.
+    #[default]
+    AionuiManaged,
+    /// The agent owns discovery from its native user/project configuration.
+    NativeOnly,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpPolicy {
+    /// AionUi resolves and injects the conversation's selected MCP servers.
+    #[default]
+    AionuiManaged,
+    /// The agent owns ordinary MCP discovery; AionUi may still inject the
+    /// ephemeral coordination server for a team session.
+    NativePlusTeam,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HarnessPolicy {
+    /// AionUi may augment the agent's launch/session capability surface.
+    #[default]
+    AionuiManaged,
+    /// Preserve the installed agent's own harness and configuration roots.
+    Preserve,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BehaviorPolicy {
     #[serde(default)]
@@ -84,6 +116,15 @@ pub struct BehaviorPolicy {
 
     #[serde(default)]
     pub supports_team: bool,
+
+    #[serde(default)]
+    pub skill_policy: SkillPolicy,
+
+    #[serde(default)]
+    pub mcp_policy: McpPolicy,
+
+    #[serde(default)]
+    pub harness_policy: HarnessPolicy,
 }
 
 /// Handshake-derived fields captured from the ACP init/session-response.
@@ -433,7 +474,7 @@ mod tests {
 
 #[cfg(test)]
 mod behavior_policy_tests {
-    use super::BehaviorPolicy;
+    use super::{BehaviorPolicy, HarnessPolicy, McpPolicy, SkillPolicy};
 
     #[test]
     fn deserializes_new_capability_flags() {
@@ -467,6 +508,28 @@ mod behavior_policy_tests {
 
         let serialized = serde_json::to_string(&with_team).unwrap();
         assert!(serialized.contains("\"supports_team\":true"));
+    }
+
+    #[test]
+    fn capability_policies_default_to_aionui_managed() {
+        let policy: BehaviorPolicy = serde_json::from_str("{}").unwrap();
+        assert_eq!(policy.skill_policy, SkillPolicy::AionuiManaged);
+        assert_eq!(policy.mcp_policy, McpPolicy::AionuiManaged);
+        assert_eq!(policy.harness_policy, HarnessPolicy::AionuiManaged);
+    }
+
+    #[test]
+    fn native_harness_policies_roundtrip() {
+        let raw = r#"{"skill_policy":"native_only","mcp_policy":"native_plus_team","harness_policy":"preserve"}"#;
+        let policy: BehaviorPolicy = serde_json::from_str(raw).unwrap();
+        assert_eq!(policy.skill_policy, SkillPolicy::NativeOnly);
+        assert_eq!(policy.mcp_policy, McpPolicy::NativePlusTeam);
+        assert_eq!(policy.harness_policy, HarnessPolicy::Preserve);
+
+        let serialized = serde_json::to_value(policy).unwrap();
+        assert_eq!(serialized["skill_policy"], "native_only");
+        assert_eq!(serialized["mcp_policy"], "native_plus_team");
+        assert_eq!(serialized["harness_policy"], "preserve");
     }
 
     /// A retired veto flag must not resurrect itself: older persisted rows still

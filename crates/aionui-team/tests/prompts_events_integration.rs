@@ -103,6 +103,7 @@ fn make_agent(slot_id: &str, name: &str, role: TeammateRole) -> TeamAgent {
         backend: "acp".into(),
         model: "claude".into(),
         assistant_id: None,
+        worker_profile: None,
         status: None,
         conversation_type: None,
         cli_path: None,
@@ -287,6 +288,7 @@ fn default_assistants() -> Vec<AvailableAssistant> {
             backend: "claude".into(),
             description: "General-purpose research assistant".into(),
             skills: vec!["web-search".into(), "synthesis".into()],
+            worker_profiles: vec![],
         },
         AvailableAssistant {
             assistant_id: "writer-assistant".into(),
@@ -294,6 +296,7 @@ fn default_assistants() -> Vec<AvailableAssistant> {
             backend: "codex".into(),
             description: "Writing-focused assistant".into(),
             skills: vec!["drafting".into()],
+            worker_profiles: vec![],
         },
         AvailableAssistant {
             assistant_id: "slides-assistant".into(),
@@ -301,6 +304,7 @@ fn default_assistants() -> Vec<AvailableAssistant> {
             backend: "gemini".into(),
             description: "Presentation builder".into(),
             skills: vec!["slides".into()],
+            worker_profiles: vec![],
         },
     ]
 }
@@ -322,7 +326,7 @@ fn lp1_lead_prompt_does_not_contain_member_snapshot() {
     assert!(!prompt.contains("- Lead ("), "lead snapshot leaked");
     assert!(!prompt.contains("- Alice ("), "teammate Alice snapshot leaked");
     assert!(!prompt.contains("- Bob ("), "teammate Bob snapshot leaked");
-    assert!(prompt.to_lowercase().contains("first team turn"));
+    assert!(prompt.to_lowercase().contains("first team-capable turn"));
     assert!(prompt.contains("team_members"));
 }
 

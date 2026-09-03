@@ -87,6 +87,24 @@ pub struct SyncChannelSettingsRequest {
     pub platform: String,
 }
 
+/// Destination used for incoming messages on a channel platform.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChannelConversationTarget {
+    /// Create or reuse the channel's ordinary assistant session.
+    #[default]
+    Assistant,
+    /// Reuse the user's single durable steward conversation.
+    Steward,
+}
+
+/// Conversation target request for a channel platform.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelConversationTargetRequest {
+    pub target: ChannelConversationTarget,
+}
+
 /// Assistant binding request for a channel platform.
 ///
 /// New writes must use assistant identity only. Legacy backend / agent fields
@@ -128,6 +146,8 @@ pub struct ChannelDefaultModelSetting {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ChannelPlatformSettingsResponse {
     pub platform: String,
+    #[serde(default)]
+    pub target: ChannelConversationTarget,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub assistant: Option<ChannelAssistantSettingResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -13,6 +13,7 @@ mod project;
 mod provider;
 mod remote_agent;
 mod skill;
+mod steward;
 mod system_settings;
 mod team;
 mod user;
@@ -39,6 +40,9 @@ pub use project::{FolderRow, ProjectExplorerRow, ProjectKind, ProjectRow, Role};
 pub use provider::Provider;
 pub use remote_agent::RemoteAgentRow;
 pub use skill::{SkillImportRecordRow, SkillRow};
+pub use steward::{
+    StewardProfileRow, StewardReportOutboxRow, StewardTaskEventRow, StewardTaskRow, StewardTaskSessionRow,
+};
 pub use system_settings::SystemSettings;
 pub use team::{MailboxMessageRow, TeamRow, TeamTaskRow};
 pub use user::{ExternalUserProjection, User, UserStatus, UserType};

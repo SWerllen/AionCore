@@ -85,6 +85,16 @@ impl TeammateStatus {
 // TeamAgent
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamWorkerProfileAudit {
+    pub worker_profile_id: String,
+    pub worker_profile_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    pub estimated_cost_micros: i64,
+    pub cost_currency: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TeamAgent {
     #[serde(default, alias = "slotId")]
@@ -107,6 +117,8 @@ pub struct TeamAgent {
         alias = "customAgentId"
     )]
     pub assistant_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_profile: Option<TeamWorkerProfileAudit>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<TeammateStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none", alias = "conversationType")]
@@ -132,6 +144,26 @@ impl TeamAgent {
             icon,
             model: self.model.clone(),
             assistant_id: self.assistant_id.clone(),
+            worker_profile_id: self
+                .worker_profile
+                .as_ref()
+                .map(|profile| profile.worker_profile_id.clone()),
+            worker_profile_name: self
+                .worker_profile
+                .as_ref()
+                .map(|profile| profile.worker_profile_name.clone()),
+            reasoning_effort: self
+                .worker_profile
+                .as_ref()
+                .and_then(|profile| profile.reasoning_effort.clone()),
+            estimated_cost_micros: self
+                .worker_profile
+                .as_ref()
+                .map(|profile| profile.estimated_cost_micros),
+            cost_currency: self
+                .worker_profile
+                .as_ref()
+                .map(|profile| profile.cost_currency.clone()),
             status: self.status.map(|s| s.to_string()),
             pending_confirmations: 0,
             context_reset: if self.role == TeammateRole::Lead {
@@ -532,6 +564,7 @@ mod tests {
             backend: "acp".into(),
             model: "claude".into(),
             assistant_id: Some("custom-1".into()),
+            worker_profile: None,
             status: Some(TeammateStatus::Working),
             conversation_type: None,
             cli_path: None,
@@ -554,6 +587,7 @@ mod tests {
             backend: "claude".into(),
             model: "opus".into(),
             assistant_id: None,
+            worker_profile: None,
             status: None,
             conversation_type: None,
             cli_path: None,
@@ -574,6 +608,7 @@ mod tests {
             backend: "acp".into(),
             model: "claude".into(),
             assistant_id: None,
+            worker_profile: None,
             status: None,
             conversation_type: None,
             cli_path: None,
@@ -593,6 +628,7 @@ mod tests {
             backend: "acp".into(),
             model: "claude".into(),
             assistant_id: Some("x".into()),
+            worker_profile: None,
             status: Some(TeammateStatus::Idle),
             conversation_type: None,
             cli_path: None,
@@ -637,6 +673,7 @@ mod tests {
             backend: "acp".into(),
             model: "claude".into(),
             assistant_id: None,
+            worker_profile: None,
             status: None,
             conversation_type: None,
             cli_path: None,
@@ -678,6 +715,7 @@ mod tests {
                 backend: "acp".into(),
                 model: "claude".into(),
                 assistant_id: None,
+                worker_profile: None,
                 status: Some(TeammateStatus::Idle),
                 conversation_type: None,
                 cli_path: None,

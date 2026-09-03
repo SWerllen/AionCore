@@ -580,6 +580,7 @@ async fn handle_message_event(event_data: serde_json::Value, message_tx: &mpsc::
         id: evt.message.message_id.clone(),
         platform: PluginType::Lark,
         chat_id: evt.message.chat_id.clone(),
+        is_group: evt.message.chat_type != "p2p",
         user,
         content: UnifiedMessageContent {
             content_type,
@@ -668,6 +669,7 @@ async fn handle_card_action(
         id: format!("card_{}", chrono_now()),
         platform: PluginType::Lark,
         chat_id,
+        is_group: true,
         user,
         content: UnifiedMessageContent {
             content_type: MessageContentType::Action,
@@ -705,6 +707,7 @@ async fn handle_bot_menu_event(event_data: serde_json::Value, message_tx: &mpsc:
         id: format!("menu_{}", chrono_now()),
         platform: PluginType::Lark,
         chat_id: evt.operator.operator_id.open_id.clone(),
+        is_group: false,
         user,
         content: UnifiedMessageContent {
             content_type: MessageContentType::Command,

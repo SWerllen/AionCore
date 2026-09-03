@@ -166,6 +166,8 @@ struct SpawnAgentParams {
     /// Assistant identifier from the available assistants catalog.
     #[serde(default)]
     assistant_id: Option<String>,
+    /// Required priced worker profile returned by team_list_assistants.
+    worker_profile_id: String,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -333,7 +335,7 @@ impl TeamStdioServer {
 
     #[tool(
         name = "team_spawn_agent",
-        description = "Create a new teammate agent to join the team.\n\nUse this only when one of the following is true:\n- The user explicitly approved the proposed teammate lineup in a previous message\n- The user explicitly instructed you to create a specific teammate immediately\n\nBefore calling this tool in the normal planning flow:\n- Start with one short sentence explaining why additional teammates would help\n- Tell the user which teammate(s) you recommend\n- Present the proposal as a table with: name, responsibility, and recommended assistant\n- Include each teammate's responsibility and recommended assistant\n- Ask whether to create them as proposed or change any names, responsibilities, or assistant choices\n- In that approval question, remind the user that they can later ask you to replace or adjust any teammate if the lineup is not working well\n- Do NOT call this tool in that same turn; wait for explicit approval in a later user message\n\nWhen calling this tool, always provide assistant_id from the available assistants catalog.\nDo not provide a model. The new teammate uses the selected assistant's configured/default model; users can adjust models from the UI model selector.\n\nThe new agent will be created and added to the team. You can then assign tasks and send messages to it."
+        description = "Create a new teammate agent to join the team.\n\nUse this only when one of the following is true:\n- The user explicitly approved the proposed teammate lineup in a previous message\n- The user explicitly instructed you to create a specific teammate immediately\n\nBefore calling this tool in the normal planning flow:\n- Start with one short sentence explaining why additional teammates would help\n- Tell the user which teammate(s) you recommend\n- Present the proposal as a table with: name, responsibility, and recommended assistant\n- Include each teammate's responsibility and recommended assistant\n- Ask whether to create them as proposed or change any names, responsibilities, or assistant choices\n- In that approval question, remind the user that they can later ask you to replace or adjust any teammate if the lineup is not working well\n- Do NOT call this tool in that same turn; wait for explicit approval in a later user message\n\nWhen calling this tool, always provide assistant_id and worker_profile_id from the available assistants catalog. Every listed assistant has at least one enabled worker profile. Estimate the task difficulty from 1 to 5 and normally choose the lowest estimated-cost profile whose difficulty_ceiling meets the task. Reliability, latency, or explicit user constraints may justify a stronger profile.\nDo not provide a raw model; model and reasoning selection come from the chosen worker profile.\n\nThe new agent will be created and added to the team. You can then assign tasks and send messages to it."
     )]
     async fn spawn_agent(&self, Parameters(params): Parameters<SpawnAgentParams>) -> CallToolResult {
         self.forward_to_tcp(
@@ -341,6 +343,7 @@ impl TeamStdioServer {
             &serde_json::json!({
                 "name": params.name,
                 "assistant_id": params.assistant_id,
+                "worker_profile_id": params.worker_profile_id,
             }),
         )
         .await
@@ -429,7 +432,7 @@ impl TeamStdioServer {
 
     #[tool(
         name = "team_list_assistants",
-        description = "List the assistants available for team spawning. Returns the real assistant catalog with real assistant_id values, names, backends, descriptions, and skills.\n\nUse this before team_spawn_agent when you need the exact assistant_id for a teammate. Do NOT guess from backend names like claude/codex/gemini — only use assistant_id values returned here."
+        description = "List the assistants available for team spawning. Returns the real assistant catalog with real assistant_id values, names, backends, descriptions, skills, and user-priced worker profiles.\n\nUse this before team_spawn_agent when you need the exact assistant_id for a teammate. Do NOT guess from backend names like claude/codex/gemini — only use assistant_id values returned here."
     )]
     async fn list_assistants(&self) -> CallToolResult {
         self.forward_to_tcp("team_list_assistants", &serde_json::json!({}))
@@ -1116,6 +1119,7 @@ mod tests {
             .spawn_agent(Parameters(SpawnAgentParams {
                 name: "CodexCLI".into(),
                 assistant_id: Some("bare:8e1acf31".into()),
+                worker_profile_id: "profile-balanced".into(),
             }))
             .await;
 

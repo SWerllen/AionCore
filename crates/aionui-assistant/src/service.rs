@@ -11,9 +11,10 @@ use aionui_api_types::{
     AssistantDefaultScalarRequest, AssistantDefaultScalarResponse, AssistantDefaultsRequest, AssistantDefaultsResponse,
     AssistantDetailResponse, AssistantEngineResponse, AssistantMcpBindingChanged, AssistantPreferencesResponse,
     AssistantProfileResponse, AssistantPromptsResponse, AssistantResponse, AssistantRulesResponse, AssistantSource,
-    AssistantStateResponse, CreateAssistantRequest, ImportAssistantsRequest, ImportAssistantsResult, ImportError,
-    SetAssistantStateRequest, UpdateAssistantRequest, WebSocketMessage, assistant_avatar_response_value_with_version,
-    assistant_mcp_binding_fingerprint, is_local_avatar_value,
+    AssistantStateResponse, AssistantWorkerProfileRequest, AssistantWorkerProfileResponse, CreateAssistantRequest,
+    ImportAssistantsRequest, ImportAssistantsResult, ImportError, SetAssistantStateRequest, UpdateAssistantRequest,
+    WebSocketMessage, assistant_avatar_response_value_with_version, assistant_mcp_binding_fingerprint,
+    is_local_avatar_value,
 };
 use aionui_common::{generate_prefixed_id, now_ms};
 use aionui_db::{
@@ -145,6 +146,47 @@ struct GeneratedAssistantReconcileContext<'a> {
     missing_index: &'a mut usize,
 }
 
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct AssistantWorkerProfileRow {
+    id: String,
+    name: String,
+    model_id: String,
+    reasoning_effort: Option<String>,
+    context_window: Option<i64>,
+    difficulty_ceiling: i64,
+    estimated_cost_micros: i64,
+    currency: String,
+    enabled: bool,
+    sort_order: i32,
+}
+
+impl TryFrom<AssistantWorkerProfileRow> for AssistantWorkerProfileResponse {
+    type Error = AssistantError;
+
+    fn try_from(row: AssistantWorkerProfileRow) -> Result<Self, Self::Error> {
+        let difficulty_ceiling = u8::try_from(row.difficulty_ceiling)
+            .ok()
+            .filter(|value| (1..=5).contains(value))
+            .ok_or_else(|| AssistantError::Internal("stored worker profile difficulty is invalid".into()))?;
+        Ok(Self {
+            id: row.id,
+            name: row.name,
+            model_id: row.model_id,
+            reasoning_effort: row.reasoning_effort,
+            context_window: row
+                .context_window
+                .map(u64::try_from)
+                .transpose()
+                .map_err(|_| AssistantError::Internal("stored worker profile context window is invalid".into()))?,
+            difficulty_ceiling,
+            estimated_cost_micros: row.estimated_cost_micros,
+            currency: row.currency,
+            enabled: row.enabled,
+            sort_order: row.sort_order,
+        })
+    }
+}
+
 impl AssistantService {
     /// Construct an `AssistantService` pinned to the runtime data directory.
     ///
@@ -191,6 +233,136 @@ impl AssistantService {
         if let Ok(mut guard) = self.event_broadcaster.write() {
             *guard = Some(broadcaster);
         }
+    }
+
+    /// Read the current user's priced execution combinations for one assistant.
+    /// Builtin assistant definitions are global, but these rows are always
+    /// user-scoped so one user's staffing budget never leaks into another's.
+    pub async fn worker_profiles_for_user(
+        &self,
+        user_id: &str,
+        assistant_id: &str,
+    ) -> Result<Vec<AssistantWorkerProfileResponse>, AssistantError> {
+        let definition = self
+            .definition_repo
+            .get_by_assistant_id_for_user(user_id, assistant_id)
+            .await?
+            .ok_or_else(|| AssistantError::NotFound(format!("assistant '{assistant_id}' not found")))?;
+        self.list_worker_profiles_for_definition(user_id, &definition.id).await
+    }
+
+    async fn list_worker_profiles_for_definition(
+        &self,
+        user_id: &str,
+        assistant_definition_id: &str,
+    ) -> Result<Vec<AssistantWorkerProfileResponse>, AssistantError> {
+        let rows = sqlx::query_as::<_, AssistantWorkerProfileRow>(
+            "SELECT id, name, model_id, reasoning_effort, context_window, difficulty_ceiling,
+                    estimated_cost_micros, currency, enabled, sort_order
+             FROM assistant_worker_profiles
+             WHERE user_id = ? AND assistant_definition_id = ?
+             ORDER BY sort_order ASC, created_at ASC, id ASC",
+        )
+        .bind(user_id)
+        .bind(assistant_definition_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| AssistantError::Internal(format!("list assistant worker profiles: {error}")))?;
+
+        rows.into_iter().map(TryInto::try_into).collect()
+    }
+
+    async fn replace_worker_profiles_for_definition(
+        &self,
+        user_id: &str,
+        assistant_definition_id: &str,
+        profiles: &[AssistantWorkerProfileRequest],
+    ) -> Result<(), AssistantError> {
+        validate_worker_profiles(profiles)?;
+
+        let existing_ids = sqlx::query_scalar::<_, String>(
+            "SELECT id FROM assistant_worker_profiles
+             WHERE user_id = ? AND assistant_definition_id = ?",
+        )
+        .bind(user_id)
+        .bind(assistant_definition_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| AssistantError::Internal(format!("list existing worker profile ids: {error}")))?
+        .into_iter()
+        .collect::<HashSet<_>>();
+
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|error| AssistantError::Internal(format!("begin worker profile replacement: {error}")))?;
+        sqlx::query(
+            "DELETE FROM assistant_worker_profiles
+             WHERE user_id = ? AND assistant_definition_id = ?",
+        )
+        .bind(user_id)
+        .bind(assistant_definition_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| AssistantError::Internal(format!("clear assistant worker profiles: {error}")))?;
+
+        let now = now_ms();
+        let mut used_ids = HashSet::new();
+        for profile in profiles {
+            let requested_id = profile.id.as_deref().map(str::trim).filter(|value| !value.is_empty());
+            let id = requested_id
+                .filter(|value| existing_ids.contains(*value) && used_ids.insert((*value).to_owned()))
+                .map(str::to_owned)
+                .unwrap_or_else(|| {
+                    let generated = generate_prefixed_id("worker-profile");
+                    used_ids.insert(generated.clone());
+                    generated
+                });
+            let name = profile.name.trim();
+            let model_id = profile.model_id.trim();
+            let reasoning_effort = profile
+                .reasoning_effort
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            let context_window = profile
+                .context_window
+                .map(i64::try_from)
+                .transpose()
+                .map_err(|_| AssistantError::BadRequest("worker profile context window is too large".to_owned()))?;
+            let currency = profile.currency.trim().to_ascii_uppercase();
+
+            sqlx::query(
+                "INSERT INTO assistant_worker_profiles (
+                    id, user_id, assistant_definition_id, name, model_id, reasoning_effort, context_window,
+                    difficulty_ceiling, estimated_cost_micros, currency, enabled, sort_order,
+                    created_at, updated_at
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&id)
+            .bind(user_id)
+            .bind(assistant_definition_id)
+            .bind(name)
+            .bind(model_id)
+            .bind(reasoning_effort)
+            .bind(context_window)
+            .bind(i64::from(profile.difficulty_ceiling))
+            .bind(profile.estimated_cost_micros)
+            .bind(currency)
+            .bind(profile.enabled)
+            .bind(profile.sort_order)
+            .bind(now)
+            .bind(now)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| AssistantError::Internal(format!("insert assistant worker profile: {error}")))?;
+        }
+
+        transaction
+            .commit()
+            .await
+            .map_err(|error| AssistantError::Internal(format!("commit worker profile replacement: {error}")))
     }
 
     /// Bootstrap unified assistant storage from builtin assets and the
@@ -951,6 +1123,9 @@ impl AssistantService {
             }
             let state = self.state_repo.get_for_user(user_id, &definition.id).await?;
             let preference = self.preference_repo.get_for_user(user_id, &definition.id).await?;
+            let worker_profiles = self
+                .list_worker_profiles_for_definition(user_id, &definition.id)
+                .await?;
             let rules_content = self.read_rule_for_user(user_id, id, locale).await?;
             let projection = self
                 .project_definition(user_id, &definition, state.as_ref(), &projections)
@@ -958,10 +1133,13 @@ impl AssistantService {
             return self.definition_to_detail_response(
                 user_id,
                 &definition,
-                state.as_ref(),
-                preference.as_ref(),
-                &rules_content,
-                &projection,
+                AssistantDetailParts {
+                    state: state.as_ref(),
+                    preference: preference.as_ref(),
+                    worker_profiles,
+                    rules_content: &rules_content,
+                    projection: &projection,
+                },
             );
         }
 
@@ -1047,6 +1225,11 @@ impl AssistantService {
         agent_rows: &[AgentManagementRow],
     ) -> Result<AssistantRuntimeProjection, AssistantError> {
         let effective_agent_id = effective_agent_id_for_definition(definition, state);
+        let effective_enabled = state.map(|row| row.enabled).unwrap_or_else(|| {
+            self.builtin_listing_default(definition)
+                .map(|(_, enabled)| enabled)
+                .unwrap_or(true)
+        });
         let runtime_backend = resolve_agent_binding_for_user(&self.pool, user_id, effective_agent_id)
             .await
             .map_err(|e| AssistantError::Internal(format!("resolve agent binding: {e}")))?
@@ -1054,6 +1237,7 @@ impl AssistantService {
         Ok(assistant_projection_for_definition(
             definition,
             state,
+            effective_enabled,
             agent_rows,
             runtime_backend.as_deref(),
         ))
@@ -1129,6 +1313,9 @@ impl AssistantService {
         user_id: &str,
         req: CreateAssistantRequest,
     ) -> Result<AssistantResponse, AssistantError> {
+        if let Some(worker_profiles) = req.worker_profiles.as_deref() {
+            validate_worker_profiles(worker_profiles)?;
+        }
         let name = req.name.trim().to_string();
         if name.is_empty() {
             return Err(AssistantError::BadRequest("name is required".into()));
@@ -1186,6 +1373,12 @@ impl AssistantService {
         {
             self.sync_preferences_from_defaults_request_for_user(user_id, &definition, None, req.defaults.as_ref())
                 .await?;
+            self.replace_worker_profiles_for_definition(
+                user_id,
+                &definition.id,
+                req.worker_profiles.as_deref().unwrap_or_default(),
+            )
+            .await?;
         }
         self.finish_assistant_mutation(user_id, &id, true).await
     }
@@ -1200,6 +1393,10 @@ impl AssistantService {
         id: &str,
         req: UpdateAssistantRequest,
     ) -> Result<AssistantResponse, AssistantError> {
+        let worker_profiles = req.worker_profiles.clone();
+        if let Some(worker_profiles) = worker_profiles.as_deref() {
+            validate_worker_profiles(worker_profiles)?;
+        }
         let mcp_binding_changed = req.defaults.as_ref().is_some_and(|defaults| defaults.mcps.is_some());
         match self.classify_source_for_user(user_id, id).await {
             AssistantSource::Builtin => {
@@ -1230,7 +1427,7 @@ impl AssistantService {
                     || builtin_defaults_forbidden
                 {
                     return Err(AssistantError::Forbidden(
-                        "Only 'agent_id', 'defaults.model', 'defaults.permission', and 'defaults.thought_level' can be overridden on built-in assistants".into(),
+                        "Only 'agent_id', 'defaults.model', 'defaults.permission', 'defaults.thought_level', and 'worker_profiles' can be overridden on built-in assistants".into(),
                     ));
                 }
 
@@ -1288,6 +1485,10 @@ impl AssistantService {
                     req.defaults.as_ref(),
                 )
                 .await?;
+                if let Some(worker_profiles) = worker_profiles.as_deref() {
+                    self.replace_worker_profiles_for_definition(user_id, &definition.id, worker_profiles)
+                        .await?;
+                }
                 return self.finish_assistant_mutation(user_id, id, mcp_binding_changed).await;
             }
             AssistantSource::Generated => {
@@ -1349,6 +1550,10 @@ impl AssistantService {
                     req.defaults.as_ref(),
                 )
                 .await?;
+                if let Some(worker_profiles) = worker_profiles.as_deref() {
+                    self.replace_worker_profiles_for_definition(user_id, &patched.id, worker_profiles)
+                        .await?;
+                }
                 return self.finish_assistant_mutation(user_id, id, mcp_binding_changed).await;
             }
             AssistantSource::User => {}
@@ -1408,6 +1613,10 @@ impl AssistantService {
                 req.defaults.as_ref(),
             )
             .await?;
+            if let Some(worker_profiles) = worker_profiles.as_deref() {
+                self.replace_worker_profiles_for_definition(user_id, &definition.id, worker_profiles)
+                    .await?;
+            }
         }
         self.finish_assistant_mutation(user_id, id, mcp_binding_changed).await
     }
@@ -1607,6 +1816,15 @@ impl AssistantService {
             warn!("failed to remove override for deleted assistant '{id}': {e}");
         }
         if let Some(definition) = self.definition_repo.get_by_assistant_id_for_user(user_id, id).await? {
+            if let Err(e) =
+                sqlx::query("DELETE FROM assistant_worker_profiles WHERE user_id = ? AND assistant_definition_id = ?")
+                    .bind(user_id)
+                    .bind(&definition.id)
+                    .execute(&self.pool)
+                    .await
+            {
+                warn!("failed to remove worker profiles for deleted assistant '{id}': {e}");
+            }
             if let Err(e) = self.state_repo.delete_for_user(user_id, &definition.id).await {
                 warn!("failed to remove assistant overlay for deleted assistant '{id}': {e}");
             }
@@ -2620,11 +2838,15 @@ impl AssistantService {
         &self,
         user_id: &str,
         definition: &AssistantDefinitionRow,
-        state: Option<&AssistantOverlayRow>,
-        preference: Option<&aionui_db::AssistantPreferenceRow>,
-        rules_content: &str,
-        projection: &AssistantRuntimeProjection,
+        parts: AssistantDetailParts<'_>,
     ) -> Result<AssistantDetailResponse, AssistantError> {
+        let AssistantDetailParts {
+            state,
+            preference,
+            worker_profiles,
+            rules_content,
+            projection,
+        } = parts;
         let builtin_default = self.builtin_listing_default(definition);
         let default_skill_ids = decode_str_list(Some(definition.default_skill_ids.as_str()))?;
         let custom_skill_names = decode_str_list(Some(definition.custom_skill_names.as_str()))?;
@@ -2720,6 +2942,7 @@ impl AssistantService {
                 last_disabled_builtin_skill_ids,
                 last_mcp_ids,
             },
+            worker_profiles,
         })
     }
 }
@@ -2739,6 +2962,81 @@ fn serialize_avatar(source: &str, avatar: Option<&str>) -> (String, Option<Strin
     };
 
     (avatar_type.to_string(), Some(value.to_string()))
+}
+
+fn validate_worker_profiles(profiles: &[AssistantWorkerProfileRequest]) -> Result<(), AssistantError> {
+    const MAX_WORKER_PROFILES: usize = 32;
+    if profiles.len() > MAX_WORKER_PROFILES {
+        return Err(AssistantError::BadRequest(format!(
+            "worker_profiles supports at most {MAX_WORKER_PROFILES} entries"
+        )));
+    }
+
+    let mut names = HashSet::new();
+    for (index, profile) in profiles.iter().enumerate() {
+        let name = profile.name.trim();
+        if name.is_empty() || name.chars().count() > 80 {
+            return Err(AssistantError::BadRequest(format!(
+                "worker_profiles[{index}].name must contain 1 to 80 characters"
+            )));
+        }
+        if !names.insert(name.to_lowercase()) {
+            return Err(AssistantError::BadRequest(format!(
+                "worker_profiles[{index}].name duplicates another profile"
+            )));
+        }
+
+        let model_id = profile.model_id.trim();
+        if model_id.is_empty() || model_id.chars().count() > 200 {
+            return Err(AssistantError::BadRequest(format!(
+                "worker_profiles[{index}].model_id must contain 1 to 200 characters"
+            )));
+        }
+        if profile
+            .reasoning_effort
+            .as_deref()
+            .is_some_and(|value| value.trim().chars().count() > 80)
+        {
+            return Err(AssistantError::BadRequest(format!(
+                "worker_profiles[{index}].reasoning_effort is too long"
+            )));
+        }
+        if profile.context_window == Some(0) {
+            return Err(AssistantError::BadRequest(format!(
+                "worker_profiles[{index}].context_window must be greater than zero"
+            )));
+        }
+        if profile
+            .context_window
+            .is_some_and(|value| i64::try_from(value).is_err())
+        {
+            return Err(AssistantError::BadRequest(format!(
+                "worker_profiles[{index}].context_window is too large"
+            )));
+        }
+        if !(1..=5).contains(&profile.difficulty_ceiling) {
+            return Err(AssistantError::BadRequest(format!(
+                "worker_profiles[{index}].difficulty_ceiling must be between 1 and 5"
+            )));
+        }
+        if profile.estimated_cost_micros < 0 {
+            return Err(AssistantError::BadRequest(format!(
+                "worker_profiles[{index}].estimated_cost_micros must not be negative"
+            )));
+        }
+        let currency = profile.currency.trim();
+        if currency.is_empty()
+            || currency.len() > 12
+            || !currency
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        {
+            return Err(AssistantError::BadRequest(format!(
+                "worker_profiles[{index}].currency must be 1 to 12 ASCII letters, digits, '_' or '-'"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn looks_like_avatar_asset(value: &str) -> bool {
@@ -2808,13 +3106,21 @@ struct AssistantRuntimeProjection {
     deletable: bool,
 }
 
+struct AssistantDetailParts<'a> {
+    state: Option<&'a AssistantOverlayRow>,
+    preference: Option<&'a aionui_db::AssistantPreferenceRow>,
+    worker_profiles: Vec<AssistantWorkerProfileResponse>,
+    rules_content: &'a str,
+    projection: &'a AssistantRuntimeProjection,
+}
+
 fn assistant_projection_for_definition(
     definition: &AssistantDefinitionRow,
     state: Option<&AssistantOverlayRow>,
+    enabled: bool,
     agent_rows: &[AgentManagementRow],
     resolved_runtime_backend: Option<&str>,
 ) -> AssistantRuntimeProjection {
-    let enabled = state.is_none_or(|row| row.enabled);
     let source = match definition.source.as_str() {
         "builtin" => AssistantSource::Builtin,
         "generated" => AssistantSource::Generated,
@@ -4222,14 +4528,29 @@ mod tests {
         let mut butler = mk_builtin("aionui-assistant", "Butler");
         butler.default_enabled = true;
         butler.sort_order = 0;
-        let fx = fixture_with_builtins(vec![disabled, butler]).await;
+        let fx = fixture_with_options(FixtureOpts {
+            builtins: vec![disabled, butler],
+            agent_rows: vec![mk_agent_row(
+                "agent-gemini",
+                "gemini",
+                aionui_api_types::AgentManagementStatus::Online,
+            )],
+            ..Default::default()
+        })
+        .await;
 
         let list = fx.service.list().await.unwrap();
         let writer = list.iter().find(|a| a.id == "builtin-writer").unwrap();
         assert!(!writer.enabled, "non-butler builtin defaults to disabled");
+        assert!(
+            !writer.team_selectable,
+            "disabled builtin must not enter the team catalog"
+        );
+        assert_eq!(writer.team_block_reason.as_deref(), Some("Assistant is disabled."));
         assert_eq!(writer.sort_order, 50, "sort_order comes from manifest");
         let butler_resp = list.iter().find(|a| a.id == "aionui-assistant").unwrap();
         assert!(butler_resp.enabled, "butler defaults to enabled");
+        assert!(butler_resp.team_selectable, "enabled builtin remains team selectable");
         assert_eq!(butler_resp.sort_order, 0);
         let butler_idx = list.iter().position(|a| a.id == "aionui-assistant").unwrap();
         let writer_idx = list.iter().position(|a| a.id == "builtin-writer").unwrap();
@@ -6929,6 +7250,86 @@ mod tests {
         assert_eq!(created.agent_id, "8e1acf31");
     }
 
+    #[tokio::test]
+    async fn worker_profiles_roundtrip_and_keep_stable_ids_on_update() {
+        let fx = fixture_with_builtins(vec![]).await;
+        let created = fx
+            .service
+            .create(CreateAssistantRequest {
+                id: Some("priced-worker".into()),
+                name: "Priced Worker".into(),
+                worker_profiles: Some(vec![AssistantWorkerProfileRequest {
+                    id: None,
+                    name: "Balanced".into(),
+                    model_id: "model-balanced".into(),
+                    reasoning_effort: Some("high".into()),
+                    context_window: Some(256_000),
+                    difficulty_ceiling: 4,
+                    estimated_cost_micros: 12_500_000,
+                    currency: "cny".into(),
+                    enabled: true,
+                    sort_order: 0,
+                }]),
+                ..req_default()
+            })
+            .await
+            .unwrap();
+
+        let detail = fx.service.get_detail(&created.id, None).await.unwrap();
+        assert_eq!(detail.worker_profiles.len(), 1);
+        let profile = detail.worker_profiles[0].clone();
+        assert_eq!(profile.currency, "CNY");
+        assert_eq!(profile.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(profile.context_window, Some(256_000));
+
+        fx.service
+            .update(
+                &created.id,
+                UpdateAssistantRequest {
+                    worker_profiles: Some(vec![AssistantWorkerProfileRequest {
+                        id: Some(profile.id.clone()),
+                        name: "Balanced v2".into(),
+                        model_id: "model-balanced".into(),
+                        reasoning_effort: Some("xhigh".into()),
+                        context_window: Some(1_000_000),
+                        difficulty_ceiling: 5,
+                        estimated_cost_micros: 15_000_000,
+                        currency: "CNY".into(),
+                        enabled: true,
+                        sort_order: 0,
+                    }]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let updated = fx.service.get_detail(&created.id, None).await.unwrap();
+        assert_eq!(updated.worker_profiles[0].id, profile.id);
+        assert_eq!(updated.worker_profiles[0].name, "Balanced v2");
+        assert_eq!(updated.worker_profiles[0].difficulty_ceiling, 5);
+        assert_eq!(updated.worker_profiles[0].context_window, Some(1_000_000));
+    }
+
+    #[test]
+    fn worker_profiles_reject_zero_context_window() {
+        let error = validate_worker_profiles(&[AssistantWorkerProfileRequest {
+            id: None,
+            name: "Invalid context".into(),
+            model_id: "model-balanced".into(),
+            reasoning_effort: None,
+            context_window: Some(0),
+            difficulty_ceiling: 3,
+            estimated_cost_micros: 0,
+            currency: "CNY".into(),
+            enabled: true,
+            sort_order: 0,
+        }])
+        .expect_err("unsupported context window must be rejected");
+
+        assert!(error.to_string().contains("context_window must be greater than zero"));
+    }
+
     fn req_default() -> CreateAssistantRequest {
         CreateAssistantRequest {
             id: None,
@@ -6947,6 +7348,7 @@ mod tests {
             recommended_prompts: None,
             recommended_prompts_i18n: None,
             defaults: None,
+            worker_profiles: None,
         }
     }
 }

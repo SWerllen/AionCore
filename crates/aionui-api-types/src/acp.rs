@@ -125,6 +125,161 @@ pub struct SetConfigOptionResponse {
     pub config_options: Option<Vec<AcpConfigOptionDto>>,
 }
 
+/// How AionUi may interact with a provider-owned persistent goal.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeGoalControlMode {
+    Structured,
+    SlashCommand,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeGoalBudgetKind {
+    Tokens,
+    None,
+}
+
+/// Provider goal lifecycle. The two `*Limited` aliases preserve the Codex
+/// app-server wire spelling while AionUi exposes snake_case JSON.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeGoalStatus {
+    Active,
+    Paused,
+    Blocked,
+    #[serde(alias = "usageLimited")]
+    UsageLimited,
+    #[serde(alias = "budgetLimited")]
+    BudgetLimited,
+    Complete,
+}
+
+impl NativeGoalStatus {
+    pub fn provider_value(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Paused => "paused",
+            Self::Blocked => "blocked",
+            Self::UsageLimited => "usageLimited",
+            Self::BudgetLimited => "budgetLimited",
+            Self::Complete => "complete",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NativeGoalCapabilities {
+    pub supported: bool,
+    #[serde(alias = "controlMode")]
+    pub control_mode: NativeGoalControlMode,
+    #[serde(alias = "canSet")]
+    pub can_set: bool,
+    #[serde(alias = "canGet")]
+    pub can_get: bool,
+    #[serde(alias = "canClear")]
+    pub can_clear: bool,
+    #[serde(alias = "canPause")]
+    pub can_pause: bool,
+    #[serde(alias = "canResume")]
+    pub can_resume: bool,
+    #[serde(alias = "budgetKind")]
+    pub budget_kind: NativeGoalBudgetKind,
+}
+
+impl NativeGoalCapabilities {
+    pub fn structured_tokens() -> Self {
+        Self {
+            supported: true,
+            control_mode: NativeGoalControlMode::Structured,
+            can_set: true,
+            can_get: true,
+            can_clear: true,
+            can_pause: true,
+            can_resume: true,
+            budget_kind: NativeGoalBudgetKind::Tokens,
+        }
+    }
+
+    pub fn slash_command() -> Self {
+        Self {
+            supported: true,
+            control_mode: NativeGoalControlMode::SlashCommand,
+            can_set: false,
+            can_get: false,
+            can_clear: false,
+            can_pause: false,
+            can_resume: false,
+            budget_kind: NativeGoalBudgetKind::None,
+        }
+    }
+
+    pub fn unsupported() -> Self {
+        Self {
+            supported: false,
+            ..Self::slash_command()
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NativeGoalSnapshot {
+    #[serde(alias = "threadId")]
+    pub thread_id: String,
+    pub objective: String,
+    pub status: NativeGoalStatus,
+    #[serde(alias = "tokenBudget")]
+    pub token_budget: Option<u64>,
+    #[serde(alias = "tokensUsed")]
+    pub tokens_used: u64,
+    #[serde(alias = "timeUsedSeconds")]
+    pub time_used_seconds: u64,
+    #[serde(alias = "createdAt")]
+    pub created_at: i64,
+    #[serde(alias = "updatedAt")]
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NativeGoalStateResponse {
+    pub provider: String,
+    pub capabilities: NativeGoalCapabilities,
+    pub goal: Option<NativeGoalSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleared: Option<bool>,
+}
+
+impl NativeGoalStateResponse {
+    pub fn slash_command(provider: impl Into<String>) -> Self {
+        Self {
+            provider: provider.into(),
+            capabilities: NativeGoalCapabilities::slash_command(),
+            goal: None,
+            cleared: None,
+        }
+    }
+
+    pub fn unsupported(provider: impl Into<String>) -> Self {
+        Self {
+            provider: provider.into(),
+            capabilities: NativeGoalCapabilities::unsupported(),
+            goal: None,
+            cleared: None,
+        }
+    }
+}
+
+/// Partial update for a provider-owned goal. `clear_token_budget` is explicit
+/// because JSON `null` and an omitted `Option` otherwise deserialize alike.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct SetNativeGoalRequest {
+    pub objective: Option<String>,
+    pub status: Option<NativeGoalStatus>,
+    pub token_budget: Option<u64>,
+    #[serde(default)]
+    pub clear_token_budget: bool,
+}
+
 /// Inner model info payload matching the frontend's `AcpModelInfo` type.
 #[derive(Debug, Clone, Serialize)]
 pub struct ModelInfoPayload {
@@ -284,6 +439,39 @@ mod tests {
         let value = serde_json::to_value(resp).unwrap();
         assert_eq!(value["confirmation"], "command_ack");
         assert!(value["config_options"].is_null());
+    }
+
+    #[test]
+    fn native_goal_deserializes_codex_camel_case_without_leaking_it_to_http() {
+        let parsed: NativeGoalStateResponse = serde_json::from_value(json!({
+            "provider": "codex",
+            "capabilities": {
+                "supported": true,
+                "controlMode": "structured",
+                "canSet": true,
+                "canGet": true,
+                "canClear": true,
+                "canPause": true,
+                "canResume": true,
+                "budgetKind": "tokens"
+            },
+            "goal": {
+                "threadId": "thread-1",
+                "objective": "Ship it",
+                "status": "usageLimited",
+                "tokenBudget": 12000,
+                "tokensUsed": 300,
+                "timeUsedSeconds": 12,
+                "createdAt": 1,
+                "updatedAt": 2
+            }
+        }))
+        .unwrap();
+        assert_eq!(parsed.goal.as_ref().unwrap().status, NativeGoalStatus::UsageLimited);
+        let http = serde_json::to_value(parsed).unwrap();
+        assert_eq!(http["capabilities"]["control_mode"], "structured");
+        assert_eq!(http["goal"]["status"], "usage_limited");
+        assert_eq!(http["goal"]["token_budget"], 12000);
     }
 
     #[test]

@@ -10,10 +10,11 @@ use axum::routing::{get, post, put};
 use tracing::warn;
 
 use aionui_api_types::{
-    ApiResponse, ApprovePairingRequest, BridgeResponse, ChannelAssistantSettingRequest, ChannelDefaultModelSetting,
-    ChannelPlatformSettingsResponse, ChannelSessionResponse, ChannelUserResponse, DisablePluginRequest,
-    EnablePluginRequest, PairingRequestResponse, PluginStatusResponse, RejectPairingRequest, RevokeUserRequest,
-    SyncChannelSettingsRequest, TestPluginRequest, TestPluginResponse,
+    ApiResponse, ApprovePairingRequest, BridgeResponse, ChannelAssistantSettingRequest,
+    ChannelConversationTargetRequest, ChannelDefaultModelSetting, ChannelPlatformSettingsResponse,
+    ChannelSessionResponse, ChannelUserResponse, DisablePluginRequest, EnablePluginRequest, PairingRequestResponse,
+    PluginStatusResponse, RejectPairingRequest, RevokeUserRequest, SyncChannelSettingsRequest, TestPluginRequest,
+    TestPluginResponse,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -115,6 +116,10 @@ pub fn channel_routes(state: ChannelRouterState) -> Router {
         .route(
             "/api/channel/settings/{platform}/default-model",
             put(set_channel_default_model_setting),
+        )
+        .route(
+            "/api/channel/settings/{platform}/target",
+            put(set_channel_conversation_target),
         )
         .route("/api/channel/settings/sync", post(sync_channel_settings))
         .with_state(state)
@@ -646,6 +651,33 @@ async fn set_channel_default_model_setting(
     Ok(Json(ApiResponse::ok(BridgeResponse {
         success: true,
         message: Some("Default model setting updated".into()),
+        error: None,
+    })))
+}
+
+/// `PUT /api/channel/settings/:platform/target` — switch between an
+/// independent assistant session and the user's fixed steward conversation.
+async fn set_channel_conversation_target(
+    State(state): State<ChannelRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(platform): Path<String>,
+    body: Result<Json<ChannelConversationTargetRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<BridgeResponse>>, ApiError> {
+    let platform = PluginType::from_str_opt(&platform)
+        .ok_or_else(|| ApiError::BadRequest(format!("Invalid platform: {}", platform)))?;
+    let Json(req) = body.map_err(ApiError::from)?;
+
+    state
+        .settings_service
+        .set_conversation_target(&user.id, platform, req.target)
+        .await?;
+    // The next incoming message must resolve the newly selected target rather
+    // than reuse a session bound under the old mode.
+    state.session_manager.clear_all_sessions(&user.id).await?;
+
+    Ok(Json(ApiResponse::ok(BridgeResponse {
+        success: true,
+        message: Some("Channel conversation target updated".into()),
         error: None,
     })))
 }

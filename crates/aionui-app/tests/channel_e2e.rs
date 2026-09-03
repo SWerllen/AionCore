@@ -330,6 +330,7 @@ async fn get_channel_settings_defaults_to_generated_aionrs_assistant() {
     let json = body_json(resp).await;
     assert!(json["success"].as_bool().unwrap());
     assert_eq!(json["data"]["platform"], "telegram");
+    assert_eq!(json["data"]["target"], "assistant");
     // With no explicit binding the platform now falls back to the generated
     // aionrs bare assistant (see channel "default to bare assistant bindings");
     // only the assistant_id is canonical, legacy fields are omitted.
@@ -343,6 +344,70 @@ async fn get_channel_settings_defaults_to_generated_aionrs_assistant() {
     assert!(json["data"]["assistant"]["backend"].is_null());
     assert!(json["data"]["assistant"]["agent_type"].is_null());
     assert!(json["data"]["default_model"].is_null());
+}
+
+#[tokio::test]
+async fn put_channel_target_persists_and_invalidates_old_sessions() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let repo: std::sync::Arc<dyn IChannelRepository> =
+        std::sync::Arc::new(SqliteChannelRepository::new(services.database.pool().clone()));
+
+    let now = now_ms();
+    repo.create_user(
+        OWNER_ID,
+        &AssistantUserRow {
+            id: "user-channel-target".to_owned(),
+            owner_user_id: OWNER_ID.to_owned(),
+            platform_user_id: "user-channel-target".to_owned(),
+            platform_type: "dingtalk".to_owned(),
+            display_name: Some("Channel Target User".to_owned()),
+            authorized_at: now,
+            last_active: Some(now),
+            session_id: None,
+        },
+    )
+    .await
+    .unwrap();
+    let channel_user = repo
+        .get_user_by_platform(OWNER_ID, "user-channel-target", "dingtalk")
+        .await
+        .unwrap()
+        .unwrap();
+    repo.get_or_create_session(
+        OWNER_ID,
+        &channel_user.id,
+        "user:channel-target",
+        &AssistantSessionRow {
+            id: "sess-channel-target".to_owned(),
+            user_id: channel_user.id.clone(),
+            agent_type: "acp".to_owned(),
+            conversation_id: None,
+            workspace: None,
+            chat_id: Some("user:channel-target".to_owned()),
+            created_at: now,
+            last_activity: now,
+        },
+    )
+    .await
+    .unwrap();
+
+    let req = json_with_token(
+        "PUT",
+        "/api/channel/settings/dingtalk/target",
+        json!({ "target": "steward" }),
+        &token,
+        &csrf,
+    );
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(repo.get_all_sessions(OWNER_ID).await.unwrap().is_empty());
+
+    let req = get_with_token("/api/channel/settings/dingtalk", &token);
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["data"]["target"], "steward");
 }
 
 #[tokio::test]

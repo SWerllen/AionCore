@@ -21,6 +21,7 @@ pub enum RuntimeWriteKind {
     AcpRecoveryCleanup,
     ResolvedWorkspace,
     StartupRecovery,
+    ShutdownRecovery,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,7 +61,9 @@ impl RuntimePersistenceCoordinator {
                     | RuntimeWriteKind::TerminalFinalize
                     | RuntimeWriteKind::ConversationFinished
             ),
-            RuntimeLifecycleState::ShuttingDown => matches!(kind, RuntimeWriteKind::UserMessage),
+            RuntimeLifecycleState::ShuttingDown => {
+                matches!(kind, RuntimeWriteKind::UserMessage | RuntimeWriteKind::ShutdownRecovery)
+            }
         };
 
         if allow {
@@ -106,6 +109,7 @@ mod tests {
             RuntimeWriteKind::AcpRecoveryCleanup,
             RuntimeWriteKind::ResolvedWorkspace,
             RuntimeWriteKind::StartupRecovery,
+            RuntimeWriteKind::ShutdownRecovery,
         ] {
             assert!(coordinator.allows("conv-1", kind), "{kind:?} should be allowed");
         }
@@ -146,5 +150,7 @@ mod tests {
         assert!(!coordinator.allows("conv-1", RuntimeWriteKind::ConversationFinished));
         assert!(!coordinator.allows("conv-1", RuntimeWriteKind::SendFailureTip));
         assert!(!coordinator.allows("conv-1", RuntimeWriteKind::AcpRecoveryCleanup));
+        assert!(!coordinator.allows("conv-1", RuntimeWriteKind::StartupRecovery));
+        assert!(coordinator.allows("conv-1", RuntimeWriteKind::ShutdownRecovery));
     }
 }

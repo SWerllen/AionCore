@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use aionui_api_types::ChannelConversationTarget;
 use tracing::{debug, info, warn};
 
 use crate::channel_settings::ChannelSettingsService;
@@ -30,6 +31,24 @@ pub enum MessageResult {
     AlreadyProcessing,
 }
 
+/// Composition-layer port used to restore or bootstrap the user's durable
+/// steward profile without introducing a channel → conversation dependency.
+#[async_trait::async_trait]
+pub trait ChannelStewardResolver: Send + Sync {
+    async fn resolve_conversation_id(&self, user_id: &str) -> Result<String, ChannelError>;
+
+    async fn try_execute_command(&self, _user_id: &str, _content: &str) -> Result<Option<String>, ChannelError> {
+        Ok(None)
+    }
+}
+
+#[derive(Debug)]
+struct DispatchBinding {
+    agent_type: String,
+    conversation_id: Option<String>,
+    is_steward: bool,
+}
+
 /// Processes incoming IM messages: authorization → action routing → AI dispatch.
 ///
 /// This is the core message entry point for the channel system. Each
@@ -42,6 +61,7 @@ pub struct ActionExecutor {
     session_mgr: Arc<SessionManager>,
     settings: Arc<ChannelSettingsService>,
     owner_user_id: Option<String>,
+    steward_resolver: Option<Arc<dyn ChannelStewardResolver>>,
 }
 
 impl ActionExecutor {
@@ -56,7 +76,13 @@ impl ActionExecutor {
             session_mgr,
             settings,
             owner_user_id,
+            steward_resolver: None,
         }
+    }
+
+    pub fn with_steward_resolver(mut self, resolver: Arc<dyn ChannelStewardResolver>) -> Self {
+        self.steward_resolver = Some(resolver);
+        self
     }
 
     pub fn owner_user_id(&self) -> Option<&str> {
@@ -97,20 +123,47 @@ impl ActionExecutor {
 
         // 2. Button callback → action routing
         if let Some(action) = &msg.action {
-            let response = self.route_action(owner_user_id, action, &internal_user_id).await?;
+            let response = self
+                .route_action(owner_user_id, action, &internal_user_id, msg.is_group)
+                .await?;
             return Ok(MessageResult::Action(response));
         }
 
         // 3. Text message → session resolution → AI dispatch
-        let agent_config = self.settings.get_agent_config(owner_user_id, msg.platform).await?;
+        let binding = self
+            .resolve_dispatch_binding(owner_user_id, msg.platform, msg.is_group)
+            .await?;
+        if binding.is_steward {
+            let resolver = self.steward_resolver.as_ref().ok_or_else(|| {
+                ChannelError::InvalidConfig("Steward target is unavailable in this AionUi runtime".to_owned())
+            })?;
+            if let Some(text) = resolver.try_execute_command(owner_user_id, &msg.content.text).await? {
+                info!(
+                    user_id = %user_id,
+                    chat_id = %chat_id,
+                    outcome = "handled",
+                    "steward machine command handled before agent dispatch"
+                );
+                return Ok(MessageResult::Action(ActionResponse {
+                    text: Some(text),
+                    parse_mode: None,
+                    buttons: None,
+                    keyboard: None,
+                    behavior: ActionBehavior::Send,
+                    toast: None,
+                    edit_message_id: None,
+                }));
+            }
+        }
         let session = self
             .session_mgr
-            .get_or_create_session(
+            .get_or_create_bound_session(
                 owner_user_id,
                 &internal_user_id,
                 chat_id,
-                &agent_config.agent_type,
+                &binding.agent_type,
                 None,
+                binding.conversation_id.as_deref(),
             )
             .await?;
 
@@ -126,6 +179,37 @@ impl ActionExecutor {
             owner_user_id: owner_user_id.to_owned(),
             session_id: session.id,
             conversation_id: session.conversation_id,
+        })
+    }
+
+    async fn resolve_dispatch_binding(
+        &self,
+        owner_user_id: &str,
+        platform: crate::types::PluginType,
+        is_group: bool,
+    ) -> Result<DispatchBinding, ChannelError> {
+        let target = self.settings.get_conversation_target(owner_user_id, platform).await?;
+
+        // The steward can control other sessions. Keep that authority scoped to
+        // an explicitly paired private chat; groups continue using the ordinary
+        // assistant configuration even when the platform target is Steward.
+        if target == ChannelConversationTarget::Steward && !is_group {
+            let resolver = self.steward_resolver.as_ref().ok_or_else(|| {
+                ChannelError::InvalidConfig("Steward target is unavailable in this AionUi runtime".to_owned())
+            })?;
+            let conversation_id = resolver.resolve_conversation_id(owner_user_id).await?;
+            return Ok(DispatchBinding {
+                agent_type: "steward".to_owned(),
+                conversation_id: Some(conversation_id),
+                is_steward: true,
+            });
+        }
+
+        let agent_config = self.settings.get_agent_config(owner_user_id, platform).await?;
+        Ok(DispatchBinding {
+            agent_type: agent_config.agent_type,
+            conversation_id: None,
+            is_steward: false,
         })
     }
 
@@ -158,10 +242,14 @@ impl ActionExecutor {
         owner_user_id: &str,
         action: &UnifiedAction,
         internal_user_id: &str,
+        is_group: bool,
     ) -> Result<ActionResponse, ChannelError> {
         match action.category {
             ActionCategory::Platform => self.handle_platform_action(owner_user_id, action).await,
-            ActionCategory::System => self.handle_system_action(owner_user_id, action, internal_user_id).await,
+            ActionCategory::System => {
+                self.handle_system_action(owner_user_id, action, internal_user_id, is_group)
+                    .await
+            }
             ActionCategory::Chat => self.handle_chat_action(action).await,
         }
     }
@@ -258,26 +346,37 @@ impl ActionExecutor {
         owner_user_id: &str,
         action: &UnifiedAction,
         internal_user_id: &str,
+        is_group: bool,
     ) -> Result<ActionResponse, ChannelError> {
         match action.action.as_str() {
             "session.new" => {
                 let user_id = internal_user_id;
                 let chat_id = &action.context.chat_id;
-                let agent_config = self
-                    .settings
-                    .get_agent_config(owner_user_id, action.context.platform)
+                let binding = self
+                    .resolve_dispatch_binding(owner_user_id, action.context.platform, is_group)
                     .await?;
                 let session = self
                     .session_mgr
-                    .reset_session(owner_user_id, user_id, chat_id, &agent_config.agent_type, None)
+                    .reset_bound_session(
+                        owner_user_id,
+                        user_id,
+                        chat_id,
+                        &binding.agent_type,
+                        None,
+                        binding.conversation_id.as_deref(),
+                    )
                     .await?;
 
                 Ok(ActionResponse {
-                    text: Some(format!(
-                        "New session created.\nAgent: {}\nSession: {}",
-                        session.agent_type,
-                        &session.id[..8]
-                    )),
+                    text: Some(if binding.is_steward {
+                        format!("Reconnected to your shared steward.\nSession: {}", &session.id[..8])
+                    } else {
+                        format!(
+                            "New session created.\nAgent: {}\nSession: {}",
+                            session.agent_type,
+                            &session.id[..8]
+                        )
+                    }),
                     parse_mode: None,
                     buttons: Some(vec![vec![ActionButton {
                         label: "Help".into(),
@@ -293,13 +392,19 @@ impl ActionExecutor {
             "session.status" => {
                 let user_id = internal_user_id;
                 let chat_id = &action.context.chat_id;
-                let agent_config = self
-                    .settings
-                    .get_agent_config(owner_user_id, action.context.platform)
+                let binding = self
+                    .resolve_dispatch_binding(owner_user_id, action.context.platform, is_group)
                     .await?;
                 let session = self
                     .session_mgr
-                    .get_or_create_session(owner_user_id, user_id, chat_id, &agent_config.agent_type, None)
+                    .get_or_create_bound_session(
+                        owner_user_id,
+                        user_id,
+                        chat_id,
+                        &binding.agent_type,
+                        None,
+                        binding.conversation_id.as_deref(),
+                    )
                     .await?;
 
                 Ok(ActionResponse {
@@ -770,6 +875,45 @@ mod tests {
         }
     }
 
+    struct StewardPrefRepo;
+
+    #[async_trait::async_trait]
+    impl IClientPreferenceRepository for StewardPrefRepo {
+        async fn get_all(&self, _user_id: &str) -> Result<Vec<ClientPreference>, DbError> {
+            Ok(vec![])
+        }
+        async fn get_by_keys(&self, user_id: &str, keys: &[&str]) -> Result<Vec<ClientPreference>, DbError> {
+            if keys.contains(&"assistant.telegram.target") {
+                return Ok(vec![ClientPreference {
+                    user_id: user_id.to_owned(),
+                    key: "assistant.telegram.target".to_owned(),
+                    value: r#""steward""#.to_owned(),
+                    updated_at: 0,
+                }]);
+            }
+            Ok(vec![])
+        }
+        async fn upsert_batch(&self, _user_id: &str, _entries: &[(&str, &str)]) -> Result<(), DbError> {
+            Ok(())
+        }
+        async fn delete_keys(&self, _user_id: &str, _keys: &[&str]) -> Result<(), DbError> {
+            Ok(())
+        }
+    }
+
+    struct FixedStewardResolver;
+
+    #[async_trait::async_trait]
+    impl ChannelStewardResolver for FixedStewardResolver {
+        async fn resolve_conversation_id(&self, _user_id: &str) -> Result<String, ChannelError> {
+            Ok("steward-conversation".to_owned())
+        }
+
+        async fn try_execute_command(&self, _user_id: &str, content: &str) -> Result<Option<String>, ChannelError> {
+            Ok((content == "有哪些任务").then(|| "任务概览：进行中 1。".to_owned()))
+        }
+    }
+
     // ── Test helpers ───────────────────────────────────────────────────
 
     fn setup() -> (ActionExecutor, Arc<MockRepo>) {
@@ -794,12 +938,25 @@ mod tests {
         (executor, repo)
     }
 
+    fn setup_steward() -> (ActionExecutor, Arc<MockRepo>) {
+        let repo = Arc::new(MockRepo::new());
+        let broadcaster = Arc::new(MockBroadcaster);
+        let pairing = Arc::new(PairingService::new(repo.clone(), broadcaster));
+        let session_mgr = Arc::new(SessionManager::new(repo.clone()));
+        let pref_repo: Arc<dyn IClientPreferenceRepository> = Arc::new(StewardPrefRepo);
+        let settings = Arc::new(ChannelSettingsService::new(pref_repo));
+        let executor = ActionExecutor::new(pairing, session_mgr, settings, Some(OWNER_ID.to_owned()))
+            .with_steward_resolver(Arc::new(FixedStewardResolver));
+        (executor, repo)
+    }
+
     fn make_text_message(user_id: &str, chat_id: &str, text: &str, platform: PluginType) -> UnifiedIncomingMessage {
         UnifiedIncomingMessage {
             owner_user_id: None,
             id: "msg_1".into(),
             platform,
             chat_id: chat_id.into(),
+            is_group: false,
             user: UnifiedUser {
                 id: user_id.into(),
                 username: None,
@@ -831,6 +988,7 @@ mod tests {
             id: "msg_1".into(),
             platform,
             chat_id: chat_id.into(),
+            is_group: false,
             user: UnifiedUser {
                 id: user_id.into(),
                 username: None,
@@ -902,6 +1060,67 @@ mod tests {
                 assert!(!session_id.is_empty());
             }
             _ => panic!("Expected Dispatched result for authorized user"),
+        }
+    }
+
+    #[tokio::test]
+    async fn private_steward_command_returns_without_creating_an_agent_session() {
+        let (executor, repo) = setup_steward();
+        repo.add_authorized_user("tg_42", "telegram");
+
+        let msg = make_text_message("tg_42", "chat_1", "有哪些任务", PluginType::Telegram);
+        let result = executor.handle_incoming_message(&msg).await.unwrap();
+
+        match result {
+            MessageResult::Action(response) => {
+                assert_eq!(response.text.as_deref(), Some("任务概览：进行中 1。"));
+                assert!(repo.sessions.lock().unwrap().is_empty());
+            }
+            _ => panic!("Expected direct steward command response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn private_non_command_still_binds_to_the_steward_agent_session() {
+        let (executor, repo) = setup_steward();
+        repo.add_authorized_user("tg_42", "telegram");
+
+        let msg = make_text_message("tg_42", "chat_1", "帮我规划今天的工作", PluginType::Telegram);
+        let result = executor.handle_incoming_message(&msg).await.unwrap();
+
+        match result {
+            MessageResult::Dispatched {
+                conversation_id,
+                session_id,
+                ..
+            } => {
+                assert_eq!(conversation_id.as_deref(), Some("steward-conversation"));
+                let session = repo
+                    .sessions
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|session| session.id == session_id)
+                    .cloned()
+                    .unwrap();
+                assert_eq!(session.agent_type, "steward");
+            }
+            _ => panic!("Expected steward-bound Dispatched result"),
+        }
+    }
+
+    #[tokio::test]
+    async fn group_message_does_not_receive_steward_control_context() {
+        let (executor, repo) = setup_steward();
+        repo.add_authorized_user("tg_42", "telegram");
+
+        let mut msg = make_text_message("tg_42", "group_1", "有哪些任务", PluginType::Telegram);
+        msg.is_group = true;
+        let result = executor.handle_incoming_message(&msg).await.unwrap();
+
+        match result {
+            MessageResult::Dispatched { conversation_id, .. } => assert!(conversation_id.is_none()),
+            _ => panic!("Expected ordinary Dispatched result for a group"),
         }
     }
 

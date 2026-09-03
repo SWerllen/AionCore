@@ -28,10 +28,17 @@ impl TeamSessionService {
             .filter(|value| !value.trim().is_empty())
             .unwrap_or(definition.agent_id.as_str());
         let effective_backend = resolve_runtime_backend(&self.agent_metadata_repo, user_id, effective_agent_id).await?;
+        let worker_profiles = self
+            .assistant_catalog
+            .resolve_team_selectable_assistant(user_id, assistant_id)
+            .await?
+            .map(|assistant| assistant.worker_profiles)
+            .unwrap_or_default();
 
         Ok(render_assistant_description_json(
             &definition,
             &effective_backend,
+            &worker_profiles,
             locale.unwrap_or("en-US"),
         )?)
     }
@@ -40,6 +47,7 @@ impl TeamSessionService {
 fn render_assistant_description_json(
     definition: &AssistantDefinitionRow,
     effective_backend: &str,
+    worker_profiles: &[crate::ports::TeamWorkerProfile],
     locale: &str,
 ) -> Result<String, serde_json::Error> {
     let name_map = decode_str_map(&definition.name_i18n);
@@ -65,6 +73,16 @@ fn render_assistant_description_json(
         "skills": skills,
         "example_tasks": example_tasks,
         "default_model": definition.default_model_value.clone(),
+        "worker_profiles": worker_profiles.iter().filter(|profile| profile.enabled).map(|profile| serde_json::json!({
+            "worker_profile_id": profile.worker_profile_id,
+            "name": profile.name,
+            "model_id": profile.model_id,
+            "reasoning_effort": profile.reasoning_effort,
+            "context_window": profile.context_window,
+            "difficulty_ceiling": profile.difficulty_ceiling,
+            "estimated_cost_micros": profile.estimated_cost_micros,
+            "currency": profile.currency,
+        })).collect::<Vec<_>>(),
     }))
 }
 

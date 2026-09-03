@@ -37,7 +37,7 @@ use aionui_realtime::EventBroadcaster;
 use aionui_team::ports::{
     AgentTurnCancellationPort, AgentTurnExecutionError, AgentTurnExecutionPort, AgentTurnOutcome, AgentTurnRequest,
     AgentTurnStarted, AgentTurnStatus, TeamAssistantCatalogEntry, TeamAssistantCatalogPort,
-    TeamConversationBindingLookup, TeamConversationLookupPort, TeamToolCapabilityPort,
+    TeamConversationBindingLookup, TeamConversationLookupPort, TeamToolCapabilityPort, TeamWorkerProfile,
 };
 use aionui_team::session::SpawnAgentRequest;
 use aionui_team::{
@@ -351,6 +351,7 @@ struct FakeConversationPorts {
     assistant_mcp_selections: Mutex<HashMap<String, TeamMcpSelection>>,
     /// `(conversation_id, option_id, requested_value)` per `set_config_option`.
     config_option_calls: Mutex<Vec<(String, String, String)>>,
+    assistant_override_calls: Mutex<Vec<(String, Option<aionui_api_types::AssistantConversationOverridesRequest>)>>,
     fail_team_temp_create: std::sync::atomic::AtomicBool,
     fail_leader_workspace_patch: std::sync::atomic::AtomicBool,
 }
@@ -372,6 +373,7 @@ impl FakeConversationPorts {
             preset_snapshots: Mutex::new(HashMap::new()),
             assistant_mcp_selections: Mutex::new(HashMap::new()),
             config_option_calls: Mutex::new(Vec::new()),
+            assistant_override_calls: Mutex::new(Vec::new()),
             fail_team_temp_create: std::sync::atomic::AtomicBool::new(false),
             fail_leader_workspace_patch: std::sync::atomic::AtomicBool::new(false),
         }
@@ -379,6 +381,12 @@ impl FakeConversationPorts {
 
     fn config_option_calls(&self) -> Vec<(String, String, String)> {
         self.config_option_calls.lock().unwrap().clone()
+    }
+
+    fn assistant_override_calls(
+        &self,
+    ) -> Vec<(String, Option<aionui_api_types::AssistantConversationOverridesRequest>)> {
+        self.assistant_override_calls.lock().unwrap().clone()
     }
 
     fn set_assistant_mcp_selection(&self, assistant_id: &str, selection: TeamMcpSelection) {
@@ -434,6 +442,10 @@ impl TeamConversationProvisioningPort for FakeConversationPorts {
                 "assistant-backed team conversations must not provide agent_type".into(),
             ));
         }
+        self.assistant_override_calls
+            .lock()
+            .unwrap()
+            .push((request.name.clone(), request.assistant_overrides.clone()));
         let id = aionui_common::generate_id();
         let now = aionui_common::now_ms();
         let workspace = request
@@ -582,6 +594,27 @@ impl TeamConversationProvisioningPort for FakeConversationPorts {
                 .filter(|value| !value.is_empty())
                 .map(str::to_owned)
         }))
+    }
+
+    async fn existing_conversation_leader(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<aionui_team::ExistingConversationLeader, aionui_team::TeamError> {
+        let row = self
+            .repo
+            .get(user_id, conversation_id)
+            .await?
+            .ok_or_else(|| aionui_team::TeamError::AgentNotFound(conversation_id.to_owned()))?;
+        let extra: serde_json::Value = serde_json::from_str(&row.extra)?;
+        Ok(aionui_team::ExistingConversationLeader {
+            conversation_id: row.id,
+            name: row.name,
+            workspace: extra["workspace"].as_str().unwrap_or_default().to_owned(),
+            backend: extra["backend"].as_str().unwrap_or("acp").to_owned(),
+            model: extra["current_model_id"].as_str().unwrap_or_default().to_owned(),
+            assistant_id: extra["assistant_id"].as_str().map(str::to_owned),
+        })
     }
 
     async fn create_team_temp_workspace(
@@ -817,6 +850,33 @@ impl TeamConversationProvisioningPort for FakeConversationPorts {
         self.repo.delete(_user_id, conversation_id).await?;
         Ok(())
     }
+
+    async fn lookup_team_binding_by_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<TeamConversationBindingLookup>, aionui_team::TeamError> {
+        let Some(user_id) = self.repo.owner_user_id(conversation_id).await? else {
+            return Ok(None);
+        };
+        let Some(row) = self.repo.get(&user_id, conversation_id).await? else {
+            return Ok(None);
+        };
+        let extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap_or(serde_json::Value::Null);
+        Ok(Some(TeamConversationBindingLookup {
+            conversation_id: row.id,
+            user_id: row.user_id,
+            team_id: extra
+                .get("teamId")
+                .or_else(|| extra.get("embedded_team_id"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+            slot_id: extra
+                .get("slot_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+            role: extra.get("role").and_then(serde_json::Value::as_str).map(str::to_owned),
+        }))
+    }
 }
 
 #[async_trait::async_trait]
@@ -869,6 +929,7 @@ impl TeamConversationLookupPort for FakeConversationPorts {
             user_id: row.user_id,
             team_id: extra
                 .get("teamId")
+                .or_else(|| extra.get("embedded_team_id"))
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned),
             slot_id: extra
@@ -1642,6 +1703,21 @@ struct TestTeamAssistantCatalog {
     agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
     assistant_definition_repo: Arc<dyn IAssistantDefinitionRepository>,
     assistant_overlay_repo: Arc<dyn IAssistantOverlayRepository>,
+    worker_profiles: Vec<TeamWorkerProfile>,
+}
+
+fn default_worker_profile() -> TeamWorkerProfile {
+    TeamWorkerProfile {
+        worker_profile_id: "profile-default".into(),
+        name: "Default test profile".into(),
+        model_id: "claude".into(),
+        reasoning_effort: None,
+        context_window: None,
+        difficulty_ceiling: 3,
+        estimated_cost_micros: 0,
+        currency: "CNY".into(),
+        enabled: true,
+    }
 }
 
 #[async_trait::async_trait]
@@ -1676,6 +1752,7 @@ impl TeamAssistantCatalogPort for TestTeamAssistantCatalog {
                 backend,
                 description: definition.description.unwrap_or_default(),
                 skills: Vec::new(),
+                worker_profiles: self.worker_profiles.clone(),
             });
         }
 
@@ -2194,6 +2271,7 @@ fn setup_with_factory_metadata_assistants_and_conversation_repo(
         agent_metadata_repo: agent_metadata_repo.clone(),
         assistant_definition_repo: assistant_definition_repo.clone(),
         assistant_overlay_repo: assistant_overlay_repo.clone(),
+        worker_profiles: vec![default_worker_profile()],
     });
     let svc = TeamSessionService::new_with_capability_port(
         team_repo_dyn,
@@ -2246,6 +2324,22 @@ fn setup_with_ports_metadata_assistants_and_conversation_repo(
     assistant_definition_repo: Arc<dyn IAssistantDefinitionRepository>,
     assistant_overlay_repo: Arc<dyn IAssistantOverlayRepository>,
 ) -> PortsServiceHarness {
+    setup_with_ports_metadata_assistants_profiles_and_conversation_repo(
+        factory,
+        agent_metadata_repo,
+        assistant_definition_repo,
+        assistant_overlay_repo,
+        vec![default_worker_profile()],
+    )
+}
+
+fn setup_with_ports_metadata_assistants_profiles_and_conversation_repo(
+    factory: AgentFactory,
+    agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
+    assistant_definition_repo: Arc<dyn IAssistantDefinitionRepository>,
+    assistant_overlay_repo: Arc<dyn IAssistantOverlayRepository>,
+    worker_profiles: Vec<TeamWorkerProfile>,
+) -> PortsServiceHarness {
     let team_repo = Arc::new(FullMockTeamRepo::new());
     let team_repo_dyn: Arc<dyn ITeamRepository> = team_repo.clone();
     let conv_repo = Arc::new(MockConversationRepo::new());
@@ -2261,6 +2355,7 @@ fn setup_with_ports_metadata_assistants_and_conversation_repo(
         agent_metadata_repo: agent_metadata_repo.clone(),
         assistant_definition_repo: assistant_definition_repo.clone(),
         assistant_overlay_repo: assistant_overlay_repo.clone(),
+        worker_profiles,
     });
     let svc = TeamSessionService::new_with_capability_port(
         team_repo_dyn,
@@ -3036,6 +3131,73 @@ async fn create_team_rejects_existing_conversation_id_request_side_adoption() {
     assert!(
         matches!(err, TeamError::InvalidRequest(ref msg) if msg.contains("existing conversations are no longer supported")),
         "unexpected error: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn embedded_team_adopts_normal_conversation_as_idempotent_leader_without_team_owned_marker() {
+    let (svc, _team_repo, _task_manager, conv_repo) = setup_with_factory_metadata_team_repo_and_conversation_repo(
+        success_factory(),
+        Arc::new(StubAgentMetadataRepo::empty()),
+    );
+    let workspace = std::env::temp_dir().join(format!("aionui-embedded-leader-{}", aionui_common::generate_id()));
+    std::fs::create_dir_all(&workspace).unwrap();
+    let now = aionui_common::now_ms();
+    conv_repo
+        .create(&ConversationRow {
+            id: "normal-leader-1".to_owned(),
+            user_id: "user1".to_owned(),
+            name: "Normal conversation".to_owned(),
+            r#type: "acp".to_owned(),
+            extra: serde_json::json!({
+                "workspace": workspace.to_string_lossy(),
+                "backend": "claude",
+                "current_model_id": "claude-sonnet",
+                "assistant_id": "general-assistant"
+            })
+            .to_string(),
+            model: None,
+            status: Some("pending".to_owned()),
+            source: Some("aionui".to_owned()),
+            channel_chat_id: None,
+            pinned: false,
+            pinned_at: None,
+            created_at: now,
+            updated_at: now,
+            project_id: None,
+            folder_id: None,
+            name_source: None,
+        })
+        .await
+        .unwrap();
+
+    let first = svc
+        .ensure_embedded_team_for_conversation("user1", "normal-leader-1")
+        .await
+        .expect("bind embedded leader");
+    let second = svc
+        .ensure_embedded_team_for_conversation("user1", "normal-leader-1")
+        .await
+        .expect("idempotent bind");
+    assert_eq!(first, second);
+
+    let row = conv_repo.get("user1", "normal-leader-1").await.unwrap().unwrap();
+    let extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap();
+    assert_eq!(extra["embedded_team_id"], first);
+    assert_eq!(extra["embedded_team"], true);
+    assert_eq!(extra["role"], "lead");
+    assert!(extra.get("teamId").is_none(), "leader stays a normal conversation");
+
+    let team = svc.get_team("user1", &first).await.expect("embedded team readable");
+    assert_eq!(team.assistants.len(), 1);
+    assert_eq!(team.assistants[0].conversation_id, "normal-leader-1");
+
+    svc.remove_embedded_team_for_leader("user1", &first, "normal-leader-1")
+        .await
+        .expect("remove hidden team only");
+    assert!(
+        conv_repo.get("user1", "normal-leader-1").await.unwrap().is_some(),
+        "leader deletion remains owned by the ordinary conversation path"
     );
 }
 
@@ -3993,6 +4155,7 @@ async fn spawned_preset_assistant_snapshot_is_frozen() {
             SpawnAgentRequest {
                 name: "Writer".into(),
                 assistant_id: Some("word-creator".into()),
+                worker_profile_id: Some("profile-default".into()),
             },
         )
         .await
@@ -4008,6 +4171,85 @@ async fn spawned_preset_assistant_snapshot_is_frozen() {
 
     let after_live_change = conv_repo.get_extra(&spawned.conversation_id).unwrap();
     assert_frozen_preset_extra(&after_live_change);
+}
+
+#[tokio::test]
+async fn leader_selected_worker_profile_drives_exact_model_reasoning_and_cost_audit() {
+    let definition_repo: Arc<dyn IAssistantDefinitionRepository> = Arc::new(SingleAssistantDefinitionRepo {
+        row: word_creator_definition(),
+    });
+    let profile = TeamWorkerProfile {
+        worker_profile_id: "profile-economy".into(),
+        name: "Economy".into(),
+        model_id: "claude-sonnet-priced".into(),
+        reasoning_effort: Some("high".into()),
+        context_window: Some(200_000),
+        difficulty_ceiling: 4,
+        estimated_cost_micros: 1_750_000,
+        currency: "CNY".into(),
+        enabled: true,
+    };
+    let (svc, _team_repo, conversation_ports, conv_repo, _task_manager) =
+        setup_with_ports_metadata_assistants_profiles_and_conversation_repo(
+            success_factory(),
+            seeded_agent_metadata_repo(),
+            definition_repo,
+            Arc::new(EmptyAssistantOverlayRepo),
+            vec![profile],
+        );
+
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Priced Spawn".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .expect("create team");
+    let lead_slot_id = created.leader_assistant_id.clone().expect("lead slot");
+    svc.ensure_session("user1", &created.id).await.expect("ensure session");
+
+    let spawned = svc
+        .spawn_agent_in_session(
+            &created.id,
+            &lead_slot_id,
+            SpawnAgentRequest {
+                name: "Priced Worker".into(),
+                assistant_id: Some("word-creator".into()),
+                worker_profile_id: Some("profile-economy".into()),
+            },
+        )
+        .await
+        .expect("spawn priced teammate");
+
+    assert_eq!(spawned.model, "claude-sonnet-priced");
+    let audit = spawned.worker_profile.as_ref().expect("worker profile audit");
+    assert_eq!(audit.worker_profile_id, "profile-economy");
+    assert_eq!(audit.reasoning_effort.as_deref(), Some("high"));
+    assert_eq!(audit.estimated_cost_micros, 1_750_000);
+    assert_eq!(audit.cost_currency, "CNY");
+
+    let (_, overrides) = conversation_ports
+        .assistant_override_calls()
+        .into_iter()
+        .find(|(name, _)| name == "Priced Worker")
+        .expect("priced worker conversation request");
+    let overrides = overrides.expect("profile conversation overrides");
+    assert_eq!(overrides.model.as_deref(), Some("claude-sonnet-priced"));
+    assert_eq!(overrides.thought_level.as_deref(), Some("high"));
+
+    let extra = conv_repo
+        .get_extra(&spawned.conversation_id)
+        .expect("spawned conversation extra");
+    assert_eq!(extra["current_model_id"], "claude-sonnet-priced");
+    assert_eq!(extra["worker_profile_id"], "profile-economy");
+    assert_eq!(extra["worker_profile_reasoning_effort"], "high");
+    assert_eq!(extra["worker_profile_context_window"], 200_000);
+    assert_eq!(extra["context_window"], 200_000);
+    assert_eq!(extra["worker_profile_estimated_cost_micros"], 1_750_000);
 }
 
 #[tokio::test]
@@ -4944,7 +5186,7 @@ async fn manual_add_agent_active_session_attaches_runtime_in_background_without_
 }
 
 #[tokio::test]
-async fn manual_add_agent_attach_failure_marks_slot_error_without_leader_notice() {
+async fn manual_add_agent_attach_failure_stays_failed_until_directed_retry() {
     use futures_util::FutureExt;
 
     let fail_next = Arc::new(AtomicBool::new(false));
@@ -5070,7 +5312,7 @@ async fn manual_add_agent_attach_failure_marks_slot_error_without_leader_notice(
 
     svc.ensure_session("user1", &created.id)
         .await
-        .expect("later ensure should retry only the failed member");
+        .expect("later ensure should keep the healthy team usable");
     assert!(Arc::ptr_eq(
         &original_scheduler,
         &svc.get_session_scheduler(&created.id)
@@ -5083,8 +5325,8 @@ async fn manual_add_agent_attach_failure_marks_slot_error_without_leader_notice(
             .iter()
             .filter(|conversation_id| *conversation_id == &agent.conversation_id)
             .count(),
-        2,
-        "the failed member should have one failed attach and one later retry"
+        1,
+        "whole-team ensure must not retry a deterministically failed member"
     );
     assert!(
         recorder
@@ -5095,7 +5337,7 @@ async fn manual_add_agent_attach_failure_marks_slot_error_without_leader_notice(
                     && event.data.get("status").and_then(serde_json::Value::as_str) == Some("ready")
                     && event.data.get("server_count").and_then(serde_json::Value::as_u64) == Some(2)
             }),
-        "single-member retry must restore team Ready"
+        "skipping the failed member must preserve team Ready"
     );
     assert!(
         !recorder
@@ -5105,23 +5347,21 @@ async fn manual_add_agent_attach_failure_marks_slot_error_without_leader_notice(
                 event.data.get("team_id").and_then(serde_json::Value::as_str) == Some(created.id.as_str())
                     && event.data.get("status").and_then(serde_json::Value::as_str) == Some("failed")
             }),
-        "a teammate add-then-retry flow must never fail the session lifecycle; the failure was inline (spec 5.4/5.5)"
+        "an inline teammate failure must never fail the session lifecycle (spec 5.4/5.5)"
     );
 }
 
 // The full-screen overlay (warming + failure card) is leader-scoped (spec
 // 5.4/5.5). A whole-team `ensure_session` — invoked on page mount, model
-// switches, and before sends via `warmupSession` — reconciles non-dormant
-// members. If it retries an already-failed TEAMMATE and the retry fails again,
-// the team must stay usable (leader ready): `ensure_session` returns Ok, no
-// session `failed` is broadcast, and the teammate failure stays inline. Only a
-// LEADER reconciliation failure may fail the whole team.
+// switches, and before sends via `warmupSession` — reconciles healthy
+// non-dormant members but does not retry an already-failed TEAMMATE. The team
+// stays usable (leader ready), while only a directed retry may start that member
+// again. Only a LEADER reconciliation failure may fail the whole team.
 #[tokio::test]
-async fn reensure_with_failed_teammate_keeps_team_usable_and_inline() {
+async fn reensure_with_failed_teammate_does_not_retry_it() {
     use futures_util::FutureExt;
 
-    // Lead builds once (cold start); every later build fails, so the teammate's
-    // attach fails on add AND on the explicit re-ensure retry.
+    // Lead builds once (cold start); the teammate's attach then fails on add.
     let build_count = Arc::new(AtomicUsize::new(0));
     let factory_count = Arc::clone(&build_count);
     let factory: AgentFactory = Arc::new(move |opts: BuildTaskOptions| {
@@ -5192,9 +5432,10 @@ async fn reensure_with_failed_teammate_keeps_team_usable_and_inline() {
 
     recorder.clear();
 
-    // Explicit full re-ensure (e.g. switching the leader's model, page remount)
-    // retries the still-broken teammate. `join_all` inside reconciliation means
-    // the teammate's failed attach has completed by the time this returns.
+    let failed_build_count = build_count.load(Ordering::SeqCst);
+
+    // Full re-ensure (e.g. switching the leader's model, page remount) must not
+    // retry a deterministic teammate startup failure.
     svc.ensure_session("user1", &created.id)
         .await
         .expect("a teammate reconciliation failure must not fail the whole team");
@@ -5224,11 +5465,15 @@ async fn reensure_with_failed_teammate_keeps_team_usable_and_inline() {
         recorder
             .events_by_name("team.agentRuntimeStatusChanged")
             .iter()
-            .any(|event| {
-                event.data.get("slot_id").and_then(serde_json::Value::as_str) == Some(failed.slot_id.as_str())
-                    && event.data.get("status").and_then(serde_json::Value::as_str) == Some("failed")
+            .all(|event| {
+                event.data.get("slot_id").and_then(serde_json::Value::as_str) != Some(failed.slot_id.as_str())
             }),
-        "the teammate failure stays inline via agentRuntimeStatusChanged"
+        "re-ensure must not emit another runtime transition for the failed teammate"
+    );
+    assert_eq!(
+        build_count.load(Ordering::SeqCst),
+        failed_build_count,
+        "re-ensure must not rebuild a failed teammate"
     );
 }
 
@@ -5309,9 +5554,8 @@ async fn failed_member_stays_inline_and_removal_restores_ready() {
     .await
     .expect("dynamic teammate failure must surface inline as a failed runtime status");
 
-    // A whole-team re-ensure retries the still-broken teammate but must keep the
-    // team usable (leader ready): it returns Ok and the failure stays inline,
-    // rather than reporting a session-level conflict (spec 5.4/5.5).
+    // A whole-team re-ensure skips the still-broken teammate and keeps the team
+    // usable (leader ready), rather than looping on a deterministic failure.
     svc.ensure_session("user1", &created.id)
         .await
         .expect("a teammate reconciliation failure must not fail the whole team");
@@ -6449,6 +6693,7 @@ async fn spawn_agent_in_session_succeeds_without_active_team_run() {
     let req = SpawnAgentRequest {
         name: "Helper".into(),
         assistant_id: Some("assistant-worker".into()),
+        worker_profile_id: Some("profile-default".into()),
     };
 
     let spawned = svc
@@ -6507,6 +6752,7 @@ async fn leader_spawn_then_immediate_ensure_joins_the_same_attach_operation() {
             SpawnAgentRequest {
                 name: "Writer".into(),
                 assistant_id: Some("word-creator".into()),
+                worker_profile_id: Some("profile-default".into()),
             },
         )
         .await
@@ -6664,6 +6910,7 @@ async fn spawn_agent_in_session_aborts_lease_when_persistence_fails() {
     let req = SpawnAgentRequest {
         name: "Helper".into(),
         assistant_id: Some("word-creator".into()),
+        worker_profile_id: Some("profile-default".into()),
     };
 
     let err = svc
@@ -6710,6 +6957,7 @@ async fn spawn_agent_in_session_compensates_when_welcome_mailbox_write_fails() {
     let req = SpawnAgentRequest {
         name: "Helper".into(),
         assistant_id: Some("word-creator".into()),
+        worker_profile_id: Some("profile-default".into()),
     };
 
     let err = svc
@@ -8443,6 +8691,7 @@ async fn agent_triggered_attach_failure_notifies_leader() {
             SpawnAgentRequest {
                 name: "Writer".into(),
                 assistant_id: Some("word-creator".into()),
+                worker_profile_id: Some("profile-default".into()),
             },
         )
         .await

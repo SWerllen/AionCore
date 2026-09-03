@@ -284,6 +284,10 @@ pub struct UnifiedIncomingMessage {
     pub id: String,
     pub platform: PluginType,
     pub chat_id: String,
+    /// Whether this event came from a group/channel rather than a private chat.
+    /// Defaults to false for older extension payloads.
+    #[serde(default)]
+    pub is_group: bool,
     pub user: UnifiedUser,
     pub content: UnifiedMessageContent,
     pub timestamp: i64,
@@ -730,6 +734,7 @@ mod tests {
             id: "msg_1".into(),
             platform: PluginType::Telegram,
             chat_id: "chat_42".into(),
+            is_group: false,
             user: UnifiedUser {
                 id: "user_1".into(),
                 username: Some("alice".into()),
@@ -984,6 +989,7 @@ mod tests {
             id: "m1".into(),
             platform: PluginType::Lark,
             chat_id: "c1".into(),
+            is_group: false,
             user: UnifiedUser {
                 id: "u1".into(),
                 username: None,

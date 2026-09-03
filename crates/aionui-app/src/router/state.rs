@@ -13,7 +13,10 @@ use aionui_assistant::{
 use aionui_auth::extract_token_from_ws_headers;
 use aionui_channel::ChannelRouterState;
 use aionui_common::AgentKillReason;
-use aionui_conversation::{ConversationRouterState, ConversationService};
+use aionui_conversation::{
+    ConversationRouterState, ConversationService, StewardArchiveTarget, StewardControlPort, StewardReportDeliveryPort,
+    StewardService,
+};
 use aionui_cron::{CronEventEmitter, CronRouterState, service::CronServiceDeps};
 use aionui_db::{
     IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
@@ -22,7 +25,7 @@ use aionui_db::{
     SqliteAssistantOverlayRepository, SqliteAssistantOverrideRepository, SqliteAssistantPreferenceRepository,
     SqliteAssistantRepository, SqliteClientPreferenceRepository, SqliteConversationRepository,
     SqliteFeedbackDiagnosticsRepository, SqliteProviderRepository, SqliteRemoteAgentRepository,
-    SqliteSettingsRepository,
+    SqliteSettingsRepository, SqliteStewardRepository,
 };
 use aionui_extension::{
     AssistantRuleDispatcher, ExtensionRegistry, ExtensionRouterState, ExtensionStateStore, ExternalPathsManager,
@@ -51,10 +54,11 @@ use aionui_system::{
 use aionui_team::{
     AgentTurnCancellationPort, AgentTurnExecutionPort, NativeSlashCommandPort, TeamAssistantCatalogEntry,
     TeamAssistantCatalogPort, TeamConversationProvisioningPort, TeamProjectionMessageStore, TeamRouterState,
-    TeamSessionService,
+    TeamSessionService, TeamWorkerProfile,
 };
 
 use crate::config::{IdentityMode, derive_encryption_key};
+use crate::router::embedded_team_adapter::EmbeddedTeamAdapter;
 use crate::router::team_capability_resolver::TeamCapabilityResolver;
 use crate::router::team_conversation_adapters::TeamConversationAdapters;
 use crate::services::AppServices;
@@ -264,10 +268,12 @@ pub async fn build_module_states(
     > = Arc::new(GeneratedAssistantMaterializerAdapter {
         assistant: assistant.service.clone(),
     });
+    let steward_service = build_steward_service(services);
     let (channel_state, channel_components) = build_channel_state(
         services,
         ext_state.registry.clone(),
         Some(generated_assistant_materializer),
+        steward_service.clone(),
     )
     .await;
     tracing::info!(elapsed_ms = boot.elapsed().as_millis(), "startup: channel state built");
@@ -300,10 +306,11 @@ pub async fn build_module_states(
     let states = ModuleStates {
         system: build_module_state_phase(&boot, "system", || build_system_state(services)),
         conversation: build_module_state_phase(&boot, "conversation", || {
-            build_conversation_state(
+            build_conversation_state_with_steward(
                 services,
                 Some(cron.cron_service.clone()),
                 Some(assistant.service.clone() as Arc<dyn AssistantRuleDispatcher>),
+                steward_service.clone(),
             )
         }),
         remote_agent: build_module_state_phase(&boot, "remote_agent", || build_remote_agent_state(services)),
@@ -361,6 +368,16 @@ pub async fn build_module_states(
             task_manager: services.worker_task_manager.clone(),
             team: states.team.service.clone(),
         }));
+    steward_service.set_control_port(Arc::new(StewardControlAdapter {
+        sidebar: states.sidebar.service.clone(),
+    }));
+    states
+        .conversation
+        .service
+        .with_team_orchestrator(Arc::new(EmbeddedTeamAdapter::new(
+            states.team.service.clone(),
+            services.active_lease_registry.clone(),
+        )));
     states
         .conversation
         .service
@@ -509,6 +526,29 @@ pub fn build_conversation_state(
     cron_service: Option<Arc<aionui_cron::service::CronService>>,
     assistant_dispatcher: Option<Arc<dyn AssistantRuleDispatcher>>,
 ) -> ConversationRouterState {
+    build_conversation_state_with_steward(
+        services,
+        cron_service,
+        assistant_dispatcher,
+        build_steward_service(services),
+    )
+}
+
+fn build_steward_service(services: &AppServices) -> StewardService {
+    StewardService::new(
+        Arc::new(SqliteStewardRepository::new(services.database.pool().clone())),
+        services.conversation_service.clone(),
+        services.worker_task_manager.clone(),
+        services.backend_binary_path().to_string_lossy().into_owned(),
+    )
+}
+
+fn build_conversation_state_with_steward(
+    services: &AppServices,
+    cron_service: Option<Arc<aionui_cron::service::CronService>>,
+    assistant_dispatcher: Option<Arc<dyn AssistantRuleDispatcher>>,
+    steward: StewardService,
+) -> ConversationRouterState {
     let conversation_service = services.conversation_service.clone();
     if let Some(dispatcher) = assistant_dispatcher {
         conversation_service.with_assistant_dispatcher(dispatcher);
@@ -518,6 +558,7 @@ pub fn build_conversation_state(
     }
     ConversationRouterState {
         service: conversation_service,
+        steward,
         task_manager: services.worker_task_manager.clone(),
         active_leases: services.active_lease_registry.clone(),
     }
@@ -660,6 +701,23 @@ impl ArchiveTeardownPorts for ArchiveTeardownAdapter {
     }
 }
 
+struct StewardControlAdapter {
+    sidebar: Arc<SidebarService>,
+}
+
+#[async_trait::async_trait]
+impl StewardControlPort for StewardControlAdapter {
+    async fn set_archived(&self, user_id: &str, target: StewardArchiveTarget, archived: bool) -> Result<(), String> {
+        let result = match (target, archived) {
+            (StewardArchiveTarget::Conversation(id), true) => self.sidebar.archive_conversation(user_id, &id).await,
+            (StewardArchiveTarget::Conversation(id), false) => self.sidebar.unarchive_conversation(user_id, &id).await,
+            (StewardArchiveTarget::Team(id), true) => self.sidebar.archive_team(user_id, &id).await,
+            (StewardArchiveTarget::Team(id), false) => self.sidebar.unarchive_team(user_id, &id).await,
+        };
+        result.map_err(|error| error.to_string())
+    }
+}
+
 /// Build the default `McpRouterState` from application services.
 pub fn build_mcp_state(services: &AppServices) -> McpRouterState {
     let pool = services.database.pool().clone();
@@ -694,6 +752,129 @@ pub fn build_mcp_state(services: &AppServices) -> McpRouterState {
 /// crate dependency; the binding happens here in the composition layer).
 struct GeneratedAssistantMaterializerAdapter {
     assistant: Arc<aionui_assistant::AssistantService>,
+}
+
+struct ChannelStewardResolverAdapter {
+    steward: StewardService,
+}
+
+pub struct StewardReportDeliveryAdapter {
+    pub manager: Arc<aionui_channel::manager::ChannelManager>,
+    pub repo: Arc<dyn aionui_db::IChannelRepository>,
+}
+
+#[async_trait::async_trait]
+impl StewardReportDeliveryPort for StewardReportDeliveryAdapter {
+    async fn deliver_im_report(
+        &self,
+        user_id: &str,
+        steward_conversation_id: &str,
+        content: &str,
+    ) -> Result<usize, String> {
+        let mut sessions = self
+            .repo
+            .get_all_sessions(user_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        sessions.retain(|session| session.conversation_id.as_deref() == Some(steward_conversation_id));
+        sessions.sort_by_key(|session| std::cmp::Reverse(session.last_activity));
+        let Some(session) = sessions.first() else {
+            return Ok(0);
+        };
+        let Some(chat_id) = session.chat_id.as_deref() else {
+            return Ok(0);
+        };
+
+        let users = self
+            .repo
+            .get_all_users(user_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        let channel_user = users
+            .iter()
+            .find(|candidate| candidate.id == session.user_id)
+            .ok_or_else(|| "The steward IM session no longer has an authorized user".to_owned())?;
+        let plugins = self
+            .repo
+            .get_all_plugins(user_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        let plugin = plugins
+            .iter()
+            .filter(|candidate| candidate.enabled && candidate.r#type == channel_user.platform_type)
+            .max_by_key(|candidate| candidate.last_connected.unwrap_or_default())
+            .ok_or_else(|| {
+                format!(
+                    "No enabled {} plugin can deliver the steward report",
+                    channel_user.platform_type
+                )
+            })?;
+        if !self.manager.is_plugin_running(user_id, &plugin.id) {
+            return Err(format!("Channel plugin {} is not running yet", plugin.id));
+        }
+
+        self.manager
+            .send_message(
+                user_id,
+                &plugin.id,
+                chat_id,
+                aionui_channel::types::UnifiedOutgoingMessage {
+                    message_type: aionui_channel::types::OutgoingMessageType::Text,
+                    text: Some(content.to_owned()),
+                    parse_mode: None,
+                    buttons: None,
+                    keyboard: None,
+                    image_url: None,
+                    file_url: None,
+                    file_name: None,
+                    media_actions: None,
+                    reply_to_message_id: None,
+                    silent: None,
+                },
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(1)
+    }
+}
+
+#[async_trait::async_trait]
+impl aionui_channel::action::ChannelStewardResolver for ChannelStewardResolverAdapter {
+    async fn resolve_conversation_id(&self, user_id: &str) -> Result<String, aionui_channel::error::ChannelError> {
+        let profile = match self.steward.profile(user_id).await {
+            Ok(Some(profile)) => profile,
+            Ok(None) => self
+                .steward
+                .bootstrap(user_id, aionui_api_types::BootstrapStewardRequest::default())
+                .await
+                .map_err(|error| {
+                    aionui_channel::error::ChannelError::InvalidConfig(format!(
+                        "Failed to restore steward profile: {error}"
+                    ))
+                })?,
+            Err(error) => {
+                return Err(aionui_channel::error::ChannelError::InvalidConfig(format!(
+                    "Failed to read steward profile: {error}"
+                )));
+            }
+        };
+        Ok(profile.conversation_id)
+    }
+
+    async fn try_execute_command(
+        &self,
+        user_id: &str,
+        content: &str,
+    ) -> Result<Option<String>, aionui_channel::error::ChannelError> {
+        let response = self
+            .steward
+            .try_execute_command(user_id, content)
+            .await
+            .map_err(|error| {
+                aionui_channel::error::ChannelError::MessageSendFailed(format!("Steward command failed: {error}"))
+            })?;
+        Ok(response.handled.then(|| response.text.unwrap_or_default()))
+    }
 }
 
 #[async_trait::async_trait]
@@ -765,6 +946,7 @@ pub async fn build_channel_state(
     generated_assistant_materializer: Option<
         Arc<dyn aionui_channel::channel_settings::ChannelGeneratedAssistantMaterializer>,
     >,
+    steward: StewardService,
 ) -> (ChannelRouterState, ChannelOrchestratorComponents) {
     let pool = services.database.pool().clone();
     let repo: Arc<dyn aionui_db::IChannelRepository> = Arc::new(aionui_db::SqliteChannelRepository::new(pool));
@@ -796,12 +978,15 @@ pub async fn build_channel_state(
     let startup_owner_user_id = startup_channel_owner_user_id(services).await;
 
     // Build orchestrator dependencies
-    let action_executor = Arc::new(aionui_channel::action::ActionExecutor::new(
-        Arc::clone(&pairing_service),
-        Arc::clone(&session_manager),
-        Arc::clone(&channel_settings),
-        startup_owner_user_id.clone(),
-    ));
+    let action_executor = Arc::new(
+        aionui_channel::action::ActionExecutor::new(
+            Arc::clone(&pairing_service),
+            Arc::clone(&session_manager),
+            Arc::clone(&channel_settings),
+            startup_owner_user_id.clone(),
+        )
+        .with_steward_resolver(Arc::new(ChannelStewardResolverAdapter { steward })),
+    );
 
     let message_service = build_channel_message_service(services, Arc::clone(&channel_settings)).await;
 
@@ -931,27 +1116,56 @@ pub fn build_team_state(
                 aionui_team::TeamError::InvalidRequest(format!("assistant catalog unavailable: {error}"))
             })?;
 
-            Ok(assistants
-                .into_iter()
-                .filter(|assistant| assistant.team_selectable)
-                .filter_map(|assistant| {
-                    let agent = assistant.agent?;
-                    let backend = agent
-                        .acp_backend
-                        .unwrap_or_else(|| agent.r#type.serde_name().to_owned());
-                    Some(TeamAssistantCatalogEntry {
-                        assistant_id: assistant.id,
-                        name: assistant.name,
-                        backend,
-                        description: assistant.description.unwrap_or_default(),
-                        skills: assistant
-                            .enabled_skills
-                            .into_iter()
-                            .chain(assistant.custom_skill_names)
-                            .collect(),
-                    })
-                })
-                .collect())
+            let mut catalog = Vec::new();
+            for assistant in assistants.into_iter().filter(|assistant| assistant.team_selectable) {
+                let Some(agent) = assistant.agent else {
+                    continue;
+                };
+                let worker_profiles = self
+                    .assistant_service
+                    .worker_profiles_for_user(user_id, &assistant.id)
+                    .await
+                    .map_err(|error| {
+                        aionui_team::TeamError::InvalidRequest(format!(
+                            "assistant worker profile catalog unavailable: {error}"
+                        ))
+                    })?
+                    .into_iter()
+                    .filter(|profile| profile.enabled)
+                    .collect::<Vec<_>>();
+                if worker_profiles.is_empty() {
+                    continue;
+                }
+                let backend = agent
+                    .acp_backend
+                    .unwrap_or_else(|| agent.r#type.serde_name().to_owned());
+                catalog.push(TeamAssistantCatalogEntry {
+                    assistant_id: assistant.id,
+                    name: assistant.name,
+                    backend,
+                    description: assistant.description.unwrap_or_default(),
+                    skills: assistant
+                        .enabled_skills
+                        .into_iter()
+                        .chain(assistant.custom_skill_names)
+                        .collect(),
+                    worker_profiles: worker_profiles
+                        .into_iter()
+                        .map(|profile| TeamWorkerProfile {
+                            worker_profile_id: profile.id,
+                            name: profile.name,
+                            model_id: profile.model_id,
+                            reasoning_effort: profile.reasoning_effort,
+                            context_window: profile.context_window,
+                            difficulty_ceiling: profile.difficulty_ceiling,
+                            estimated_cost_micros: profile.estimated_cost_micros,
+                            currency: profile.currency,
+                            enabled: true,
+                        })
+                        .collect(),
+                });
+            }
+            Ok(catalog)
         }
     }
 

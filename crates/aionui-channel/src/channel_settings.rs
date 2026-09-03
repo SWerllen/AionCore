@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use aionui_api_types::{
-    ChannelAssistantSettingRequest, ChannelAssistantSettingResponse, ChannelDefaultModelSetting,
-    ChannelPlatformSettingsResponse,
+    ChannelAssistantSettingRequest, ChannelAssistantSettingResponse, ChannelConversationTarget,
+    ChannelDefaultModelSetting, ChannelPlatformSettingsResponse,
 };
 use aionui_common::ProviderWithModel;
 use aionui_db::{
@@ -21,6 +21,7 @@ const DEFAULT_AGENT_TYPE: &str = "aionrs";
 /// Keys follow the pattern established by the old Electron frontend:
 /// - `assistant.{platform}.agent`       → JSON `{"backend":"claude","name":"Claude"}`
 /// - `assistant.{platform}.defaultModel` → JSON `{"id":"provider_id","use_model":"model_name"}`
+/// - `assistant.{platform}.target`      → JSON `"assistant"` or `"steward"`
 pub struct ChannelSettingsService {
     pref_repo: Arc<dyn IClientPreferenceRepository>,
     agent_metadata_repo: Option<Arc<dyn IAgentMetadataRepository>>,
@@ -208,10 +209,15 @@ impl ChannelSettingsService {
     ) -> Result<ChannelPlatformSettingsResponse, ChannelError> {
         let key_agent = agent_key(platform);
         let key_model = model_key(platform);
-        let prefs = self.pref_repo.get_by_keys(user_id, &[&key_agent, &key_model]).await?;
+        let key_target = target_key(platform);
+        let prefs = self
+            .pref_repo
+            .get_by_keys(user_id, &[&key_agent, &key_model, &key_target])
+            .await?;
 
         let mut assistant = None;
         let mut default_model = None;
+        let mut target = ChannelConversationTarget::Assistant;
 
         for pref in prefs {
             if pref.key == key_agent {
@@ -223,6 +229,8 @@ impl ChannelSettingsService {
                 }
             } else if pref.key == key_model {
                 default_model = parse_channel_model_setting(&pref.value);
+            } else if pref.key == key_target {
+                target = parse_channel_target(&pref.value).unwrap_or_default();
             }
         }
 
@@ -232,9 +240,26 @@ impl ChannelSettingsService {
 
         Ok(ChannelPlatformSettingsResponse {
             platform: platform.to_string(),
+            target,
             assistant,
             default_model,
         })
+    }
+
+    /// Reads the persisted conversation target, defaulting legacy settings to
+    /// the ordinary assistant path.
+    pub async fn get_conversation_target(
+        &self,
+        user_id: &str,
+        platform: PluginType,
+    ) -> Result<ChannelConversationTarget, ChannelError> {
+        let key = target_key(platform);
+        let prefs = self.pref_repo.get_by_keys(user_id, &[&key]).await?;
+        Ok(prefs
+            .into_iter()
+            .next()
+            .and_then(|pref| parse_channel_target(&pref.value))
+            .unwrap_or_default())
     }
 
     pub async fn get_assistant_setting(
@@ -284,6 +309,20 @@ impl ChannelSettingsService {
     ) -> Result<(), ChannelError> {
         let payload = serde_json::to_string(model).map_err(ChannelError::Json)?;
         let key = model_key(platform);
+        self.pref_repo
+            .upsert_batch(user_id, &[(&key, payload.as_str())])
+            .await?;
+        Ok(())
+    }
+
+    pub async fn set_conversation_target(
+        &self,
+        user_id: &str,
+        platform: PluginType,
+        target: ChannelConversationTarget,
+    ) -> Result<(), ChannelError> {
+        let payload = serde_json::to_string(&target).map_err(ChannelError::Json)?;
+        let key = target_key(platform);
         self.pref_repo
             .upsert_batch(user_id, &[(&key, payload.as_str())])
             .await?;
@@ -484,6 +523,10 @@ fn model_key(platform: PluginType) -> String {
     format!("assistant.{platform}.defaultModel")
 }
 
+fn target_key(platform: PluginType) -> String {
+    format!("assistant.{platform}.target")
+}
+
 fn default_agent_config() -> ResolvedAgentConfig {
     ResolvedAgentConfig {
         agent_type: DEFAULT_AGENT_TYPE.to_owned(),
@@ -530,6 +573,10 @@ fn parse_channel_model_setting(value: &str) -> Option<ChannelDefaultModelSetting
     let id = parsed["id"].as_str()?.to_owned();
     let use_model = parsed["use_model"].as_str()?.to_owned();
     Some(ChannelDefaultModelSetting { id, use_model })
+}
+
+fn parse_channel_target(value: &str) -> Option<ChannelConversationTarget> {
+    serde_json::from_str(value).ok()
 }
 
 /// Maps a backend identifier to the corresponding `AgentType` serde name.
@@ -1096,6 +1143,51 @@ mod tests {
 
         let config = svc.get_model_config(TEST_USER_ID, PluginType::Telegram).await.unwrap();
         assert!(config.is_none());
+    }
+
+    #[tokio::test]
+    async fn conversation_target_defaults_to_assistant_for_legacy_settings() {
+        let repo = Arc::new(MockPrefRepo::new());
+        let svc = ChannelSettingsService::new(repo);
+
+        let target = svc
+            .get_conversation_target(TEST_USER_ID, PluginType::Telegram)
+            .await
+            .unwrap();
+
+        assert_eq!(target, ChannelConversationTarget::Assistant);
+    }
+
+    #[tokio::test]
+    async fn conversation_target_persists_and_is_returned_with_platform_settings() {
+        let repo = Arc::new(MockPrefRepo::new());
+        let svc = ChannelSettingsService::new(repo.clone());
+
+        svc.set_conversation_target(TEST_USER_ID, PluginType::Dingtalk, ChannelConversationTarget::Steward)
+            .await
+            .unwrap();
+
+        // Model an application restart: the selected target must come from
+        // client_preferences, not process memory.
+        drop(svc);
+        let svc = ChannelSettingsService::new(repo.clone());
+
+        let target = svc
+            .get_conversation_target(TEST_USER_ID, PluginType::Dingtalk)
+            .await
+            .unwrap();
+        let settings = svc
+            .get_platform_settings(TEST_USER_ID, PluginType::Dingtalk)
+            .await
+            .unwrap();
+        let stored = repo
+            .get_by_keys(TEST_USER_ID, &["assistant.dingtalk.target"])
+            .await
+            .unwrap();
+
+        assert_eq!(target, ChannelConversationTarget::Steward);
+        assert_eq!(settings.target, ChannelConversationTarget::Steward);
+        assert_eq!(stored[0].value, r#""steward""#);
     }
 
     #[tokio::test]

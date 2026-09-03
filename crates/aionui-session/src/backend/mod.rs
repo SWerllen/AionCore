@@ -45,9 +45,9 @@ pub use rehydrate::rehydrate;
 // core; it is consumed intra-crate by the claude/codex/acp backend impls (each
 // embeds a `SuspendController`), so it is not re-exported from the crate root.
 pub use types::{
-    Admission, BackendError, CancelTarget, Command, CommandMeta, CommandReceipt, ContentBlock, PendingPermissionView,
-    PermissionDecision, QuestionAnswer, SessionEnvelope, SessionInfoKind, SessionSpec, StateSnapshot, Tier2Checkpoint,
-    TransitionReason, command_name,
+    Admission, BackendError, CancelTarget, Command, CommandMeta, CommandReceipt, ContentBlock, NativeGoal,
+    NativeGoalStatus, NativeGoalUpdate, PendingPermissionView, PermissionDecision, QuestionAnswer, SessionEnvelope,
+    SessionInfoKind, SessionSpec, StateSnapshot, Tier2Checkpoint, TransitionReason, command_name,
 };
 
 use crate::capability::Capabilities;
@@ -79,6 +79,12 @@ pub(crate) fn handshake_budget() -> std::time::Duration {
 /// frame writer (a microsecond byte-frame lock, not a per-turn lock).
 #[async_trait::async_trait]
 pub trait SessionBackend: Send + Sync {
+    /// Stable provider identifier for narrow provider-owned control surfaces.
+    /// Most backends need no such surface and retain the neutral default.
+    fn provider_name(&self) -> &'static str {
+        "session"
+    }
+
     /// Dispatch a command. FAST: returns a receipt the instant the adapter has
     /// accepted+queued it on the wire — does NOT block on turn completion (the
     /// turn flows up `events()`). Capability-gated: an unsupported command
@@ -93,6 +99,23 @@ pub trait SessionBackend: Send + Sync {
     /// Read-once capability snapshot (gates UI affordances + dispatch). Immutable
     /// within a session; reconnect mints a NEW handle with a fresh snapshot.
     fn capabilities(&self) -> Capabilities;
+
+    /// Read a goal owned and persisted by the provider's native harness. This
+    /// is intentionally separate from `Command`: it is a synchronous control
+    /// query, not a conversational turn and must not affect turn lifecycle.
+    async fn native_goal_get(&self) -> Result<Option<NativeGoal>, BackendError> {
+        Err(BackendError::CommandNotSupported { command: "native_goal" })
+    }
+
+    /// Partially update the provider-owned goal without opening a turn.
+    async fn native_goal_set(&self, _update: NativeGoalUpdate) -> Result<NativeGoal, BackendError> {
+        Err(BackendError::CommandNotSupported { command: "native_goal" })
+    }
+
+    /// Clear the provider-owned goal without opening a turn.
+    async fn native_goal_clear(&self) -> Result<bool, BackendError> {
+        Err(BackendError::CommandNotSupported { command: "native_goal" })
+    }
 
     /// Read-only snapshot of currently-open (unanswered) permission requests, for
     /// REST recovery (`GET /confirmations`) of a reloaded `waiting_confirmation`

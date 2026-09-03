@@ -24,8 +24,8 @@ use crate::protocol::send_error::AgentSendError;
 use crate::types::{PromptMediaCaps, SendMessageData};
 
 use aionui_api_types::{
-    GetConfigOptionsResponse, GetModelInfoResponse, ModelInfoEntry, ModelInfoPayload, SetConfigOptionResponse,
-    SideQuestionRequest, SideQuestionResponse, SlashCommandItem,
+    GetConfigOptionsResponse, GetModelInfoResponse, ModelInfoEntry, ModelInfoPayload, NativeGoalStateResponse,
+    SetConfigOptionResponse, SetNativeGoalRequest, SideQuestionRequest, SideQuestionResponse, SlashCommandItem,
 };
 
 #[cfg(any(test, feature = "test-support"))]
@@ -511,6 +511,59 @@ impl AgentInstance {
             Self::Session(m) => m.get_slash_commands().await,
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(m) => m.get_slash_commands().await,
+        }
+    }
+
+    /// Read provider-owned goal state. ACP agents may expose the structured
+    /// AionUi extension; agents that only advertise `/goal` are surfaced as
+    /// command mode without AionUi fabricating an independent goal state.
+    pub async fn get_native_goal(&self) -> Result<NativeGoalStateResponse, AgentError> {
+        match self {
+            Self::Acp(manager) => match manager.native_goal_request("_aionui/session/goal/get", None).await {
+                Ok(state) => Ok(state),
+                Err(AgentError::Acp(crate::protocol::error::AcpError::MethodNotFound { .. })) => {
+                    let has_goal_command = manager
+                        .load_slash_commands()
+                        .await?
+                        .iter()
+                        .any(|item| item.command.trim_start_matches('/') == "goal");
+                    let provider = manager.backend().unwrap_or("acp");
+                    if has_goal_command {
+                        Ok(NativeGoalStateResponse::slash_command(provider))
+                    } else {
+                        Ok(NativeGoalStateResponse::unsupported(provider))
+                    }
+                }
+                Err(error) => Err(error),
+            },
+            Self::Aionrs(_) => Ok(NativeGoalStateResponse::unsupported("aionrs")),
+            Self::Session(manager) => manager.get_native_goal().await,
+            #[cfg(any(test, feature = "test-support"))]
+            Self::Mock(_) => Ok(NativeGoalStateResponse::unsupported("mock")),
+        }
+    }
+
+    pub async fn set_native_goal(&self, request: &SetNativeGoalRequest) -> Result<NativeGoalStateResponse, AgentError> {
+        match self {
+            Self::Acp(manager) => {
+                manager
+                    .native_goal_request("_aionui/session/goal/set", Some(request))
+                    .await
+            }
+            Self::Session(manager) => manager.set_native_goal(request).await,
+            _ => Err(AgentError::conflict(
+                "This agent does not expose structured native goal control",
+            )),
+        }
+    }
+
+    pub async fn clear_native_goal(&self) -> Result<NativeGoalStateResponse, AgentError> {
+        match self {
+            Self::Acp(manager) => manager.native_goal_request("_aionui/session/goal/clear", None).await,
+            Self::Session(manager) => manager.clear_native_goal().await,
+            _ => Err(AgentError::conflict(
+                "This agent does not expose structured native goal control",
+            )),
         }
     }
 

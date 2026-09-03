@@ -2,8 +2,9 @@ use std::sync::Arc;
 
 use aionui_ai_agent::IWorkerTaskManager;
 use aionui_api_types::{
-    AddAgentRequest, GetConfigOptionsResponse, McpRuntimeSnapshot, SetConfigOptionRequest, SetConfigOptionResponse,
-    TeamAgentInput, TeamMcpSelection, TeamToolTransport, assistant_mcp_binding_fingerprint,
+    AddAgentRequest, AssistantConversationOverridesRequest, GetConfigOptionsResponse, McpRuntimeSnapshot,
+    SetConfigOptionRequest, SetConfigOptionResponse, TeamAgentInput, TeamMcpSelection, TeamToolTransport,
+    assistant_mcp_binding_fingerprint,
 };
 use aionui_common::{AgentKillReason, AgentType, ProviderWithModel, generate_id};
 use aionui_db::models::{AgentMetadataRow, TeamRow};
@@ -14,10 +15,10 @@ use tracing::{info, warn};
 use crate::error::TeamError;
 use crate::mcp::TeamMcpStdioConfig;
 use crate::ports::TeamConversationBindingLookup;
-use crate::ports::{TeamAssistantCatalogPort, TeamToolCapabilityPort};
+use crate::ports::{TeamAssistantCatalogPort, TeamToolCapabilityPort, TeamWorkerProfile};
 use crate::service::inherit_team_workspace;
 use crate::service::spawn_support::{agent_type_for_backend, cli_backend_metadata, session_mode_for_backend};
-use crate::types::{Team, TeamAgent, TeammateRole};
+use crate::types::{Team, TeamAgent, TeamWorkerProfileAudit, TeammateRole};
 use crate::workspace::TeamWorkspaceResolver;
 
 #[derive(Clone)]
@@ -50,6 +51,7 @@ struct NewAgentProvisioning {
     backend: String,
     model: String,
     assistant_id: Option<String>,
+    worker_profile: Option<TeamWorkerProfile>,
     workspace: Option<String>,
     session_mode: Option<String>,
 }
@@ -62,6 +64,7 @@ pub(crate) struct PersistSpawnedAgentRequest {
     pub backend: String,
     pub model: String,
     pub assistant_id: Option<String>,
+    pub worker_profile: Option<TeamWorkerProfile>,
 }
 
 pub struct TeamConversationCreateRequest {
@@ -70,6 +73,7 @@ pub struct TeamConversationCreateRequest {
     pub name: String,
     pub top_level_model: Option<ProviderWithModel>,
     pub assistant_id: Option<String>,
+    pub assistant_overrides: Option<AssistantConversationOverridesRequest>,
     pub extra: serde_json::Value,
 }
 
@@ -77,6 +81,18 @@ pub struct TeamConversationCreateRequest {
 pub struct TeamConversationCreateResult {
     pub conversation_id: String,
     pub workspace: String,
+}
+
+/// Runtime identity read from an already-created normal conversation when it
+/// becomes the persistent leader of an embedded team.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExistingConversationLeader {
+    pub conversation_id: String,
+    pub name: String,
+    pub workspace: String,
+    pub backend: String,
+    pub model: String,
+    pub assistant_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -101,6 +117,16 @@ pub trait TeamConversationProvisioningPort: Send + Sync {
     async fn conversation_workspace(&self, conversation_id: &str) -> Result<Option<String>, TeamError>;
 
     async fn conversation_assistant_id(&self, conversation_id: &str) -> Result<Option<String>, TeamError>;
+
+    async fn existing_conversation_leader(
+        &self,
+        _user_id: &str,
+        _conversation_id: &str,
+    ) -> Result<ExistingConversationLeader, TeamError> {
+        Err(TeamError::InvalidRequest(
+            "existing conversation leader adoption is unavailable".to_owned(),
+        ))
+    }
 
     async fn create_team_temp_workspace(&self, user_id: &str, team_id: &str) -> Result<String, TeamError>;
 
@@ -283,6 +309,7 @@ impl TeamAgentProvisioner {
                 &leader_backend,
                 &leader_input.model,
                 leader_assistant_id.as_deref(),
+                None,
                 shared_workspace,
                 None,
                 Some(&leader_mcp_selection),
@@ -311,6 +338,7 @@ impl TeamAgentProvisioner {
             backend: leader_backend,
             model: leader_input.model.clone(),
             assistant_id: leader_assistant_id,
+            worker_profile: None,
             status: None,
             conversation_type: None,
             cli_path: None,
@@ -339,6 +367,7 @@ impl TeamAgentProvisioner {
                     &backend,
                     &input.model,
                     assistant_id.as_deref(),
+                    None,
                     Some(&team_workspace),
                     None,
                     Some(&mcp_selection),
@@ -352,6 +381,7 @@ impl TeamAgentProvisioner {
                 backend,
                 model: input.model.clone(),
                 assistant_id,
+                worker_profile: None,
                 status: None,
                 conversation_type: None,
                 cli_path: None,
@@ -410,6 +440,7 @@ impl TeamAgentProvisioner {
                     backend,
                     model: req.model,
                     assistant_id,
+                    worker_profile: None,
                     workspace: Some(workspace),
                     session_mode: row.session_mode.clone(),
                 },
@@ -470,6 +501,7 @@ impl TeamAgentProvisioner {
                     backend: req.backend,
                     model: req.model,
                     assistant_id: req.assistant_id,
+                    worker_profile: req.worker_profile,
                     workspace: Some(workspace),
                     session_mode: row.session_mode.clone(),
                 },
@@ -711,6 +743,7 @@ impl TeamAgentProvisioner {
                 &input.backend,
                 &input.model,
                 input.assistant_id.as_deref(),
+                input.worker_profile.as_ref(),
                 input.workspace.as_deref(),
                 input.session_mode.as_deref(),
                 mcp_selection,
@@ -724,6 +757,13 @@ impl TeamAgentProvisioner {
             backend: input.backend,
             model: input.model,
             assistant_id: input.assistant_id,
+            worker_profile: input.worker_profile.map(|profile| TeamWorkerProfileAudit {
+                worker_profile_id: profile.worker_profile_id,
+                worker_profile_name: profile.name,
+                reasoning_effort: profile.reasoning_effort,
+                estimated_cost_micros: profile.estimated_cost_micros,
+                cost_currency: profile.currency,
+            }),
             status: None,
             conversation_type: None,
             cli_path: None,
@@ -741,13 +781,14 @@ impl TeamAgentProvisioner {
         backend: &str,
         model: &str,
         assistant_id: Option<&str>,
+        worker_profile: Option<&TeamWorkerProfile>,
         workspace: Option<&str>,
         session_mode: Option<&str>,
         mcp_selection: Option<&TeamMcpSelection>,
     ) -> Result<ProvisionedConversation, TeamError> {
         let cli_metadata = cli_backend_metadata(&self.agent_metadata_repo, user_id, backend).await?;
         let agent_type = agent_type_for_backend(cli_metadata.as_ref(), backend)?;
-        let extra = self.build_team_extra(
+        let mut extra = self.build_team_extra(
             team_id,
             slot_id,
             role,
@@ -760,10 +801,30 @@ impl TeamAgentProvisioner {
             session_mode,
             mcp_selection,
         );
+        if let Some(profile) = worker_profile {
+            extra["worker_profile_id"] = serde_json::Value::String(profile.worker_profile_id.clone());
+            extra["worker_profile_name"] = serde_json::Value::String(profile.name.clone());
+            extra["worker_profile_difficulty_ceiling"] =
+                serde_json::Value::Number(i64::from(profile.difficulty_ceiling).into());
+            extra["worker_profile_estimated_cost_micros"] =
+                serde_json::Value::Number(profile.estimated_cost_micros.into());
+            extra["worker_profile_currency"] = serde_json::Value::String(profile.currency.clone());
+            if let Some(reasoning_effort) = profile.reasoning_effort.as_ref() {
+                extra["worker_profile_reasoning_effort"] = serde_json::Value::String(reasoning_effort.clone());
+            }
+            if let Some(context_window) = profile.context_window {
+                extra["worker_profile_context_window"] = serde_json::Value::Number(context_window.into());
+                // Qoder consumes this persisted field at process launch through
+                // its verified `--context-window <size>` CLI option.
+                extra["context_window"] = serde_json::Value::Number(context_window.into());
+            }
+        }
         let provider_id = if agent_type == AgentType::Aionrs {
-            self.resolve_provider_for_model(user_id, model)
-                .await
-                .unwrap_or_else(|| backend.to_owned())
+            self.resolve_provider_for_model(user_id, model).await.ok_or_else(|| {
+                TeamError::InvalidRequest(format!(
+                    "No enabled provider exposes model '{model}'; the AionRS worker cannot be started"
+                ))
+            })?
         } else {
             backend.to_owned()
         };
@@ -790,6 +851,11 @@ impl TeamAgentProvisioner {
                 name: name.to_owned(),
                 top_level_model,
                 assistant_id: assistant_id.map(str::to_owned),
+                assistant_overrides: worker_profile.map(|profile| AssistantConversationOverridesRequest {
+                    model: Some(profile.model_id.clone()),
+                    thought_level: profile.reasoning_effort.clone(),
+                    ..Default::default()
+                }),
                 extra,
             })
             .await?;
@@ -1435,6 +1501,7 @@ mod tests {
             backend: "acp".into(),
             model: "sonnet".into(),
             assistant_id: None,
+            worker_profile: None,
             status: None,
             conversation_type: None,
             cli_path: None,

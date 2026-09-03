@@ -31,6 +31,7 @@ pub mod session_agent;
 pub mod session_context;
 pub mod shared_kernel;
 pub mod skill_delivery_plan;
+mod steward_isolation;
 pub mod task_manager;
 pub mod terminal;
 pub mod types;

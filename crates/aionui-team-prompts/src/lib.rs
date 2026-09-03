@@ -5,8 +5,8 @@ pub mod tools;
 
 pub use governance::{TEAM_GOVERNANCE_PROMPT, with_team_governance};
 pub use role_prompt::{
-    AvailableAgentType, AvailableAssistant, LeadPromptParams, TeamPromptAgent, TeamPromptRole, TeammatePromptParams,
-    build_lead_prompt, build_teammate_prompt,
+    AvailableAgentType, AvailableAssistant, AvailableWorkerProfile, LeadPromptParams, TeamPromptAgent, TeamPromptRole,
+    TeammatePromptParams, build_lead_prompt, build_teammate_prompt,
 };
 pub use team_tool_usage::build_team_tool_usage;
 pub use tools::{
