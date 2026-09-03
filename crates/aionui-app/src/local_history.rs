@@ -218,6 +218,7 @@ async fn sync(
         Err(error) => response.qoder.errors.push(error),
     }
 
+    merge_orphaned_worktrees(&mut sessions);
     sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
     let bindings = load_bindings(&state.pool, &user.id).await.map_err(internal)?;
     let anchors = load_native_anchors(&state.pool, &user.id).await.map_err(internal)?;
@@ -316,6 +317,50 @@ async fn sync(
     response.projects_grouped = grouped_projects.len();
     response.synced_at = now_ms();
     Ok(Json(ApiResponse::ok(response)))
+}
+
+/// A removed or partially cleaned native worktree can leave the workspace
+/// directory behind without its `.git` pointer.  In that case git2 cannot
+/// identify the repository and the task would otherwise appear as a second,
+/// same-named project.  Reuse an unambiguous repository identity discovered
+/// from another local session with the same checkout name.
+fn merge_orphaned_worktrees(sessions: &mut [NativeSession]) {
+    let mut repositories: HashMap<String, Option<(String, PathBuf)>> = HashMap::new();
+    for session in sessions
+        .iter()
+        .filter(|session| session.project_key.starts_with("git:"))
+    {
+        let Some(name) = session.project_root.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        let identity = (session.project_key.clone(), session.project_root.clone());
+        repositories
+            .entry(name.to_owned())
+            .and_modify(|current| {
+                if current.as_ref() != Some(&identity) {
+                    *current = None;
+                }
+            })
+            .or_insert(Some(identity));
+    }
+
+    for session in sessions
+        .iter_mut()
+        .filter(|session| session.project_key.starts_with("path:") && is_native_worktree_path(&session.cwd))
+    {
+        let Some(name) = session.cwd.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if let Some(Some((project_key, project_root))) = repositories.get(name) {
+            session.project_key.clone_from(project_key);
+            session.project_root.clone_from(project_root);
+        }
+    }
+}
+
+fn is_native_worktree_path(path: &Path) -> bool {
+    let value = path.to_string_lossy();
+    value.contains("/.codex/worktrees/") || value.contains("/.qoder/worktrees/")
 }
 
 async fn import_session(
@@ -1203,5 +1248,43 @@ mod tests {
         assert_eq!(session.title, "同步旧任务并按项目分组");
         assert_eq!(session.cwd, temp.path());
         assert_eq!(session.source_path.as_deref(), Some(path.as_path()));
+    }
+
+    #[test]
+    fn orphaned_native_worktree_joins_the_unambiguous_repository() {
+        let make_session = |cwd: &str, project_key: &str, project_root: &str| NativeSession {
+            provider: "codex",
+            native_id: cwd.to_owned(),
+            title: String::new(),
+            preview: None,
+            cwd: PathBuf::from(cwd),
+            source_path: None,
+            updated_at: 0,
+            created_at: 0,
+            archived: false,
+            project_key: project_key.to_owned(),
+            project_root: PathBuf::from(project_root),
+        };
+        let mut sessions = vec![
+            make_session(
+                "/Users/test/codes/example",
+                "git:git@example.com:team/example",
+                "/Users/test/codes/example",
+            ),
+            make_session(
+                "/Users/test/.codex/worktrees/1234/example",
+                "path:/Users/test/.codex/worktrees/1234/example",
+                "/Users/test/.codex/worktrees/1234/example",
+            ),
+        ];
+
+        merge_orphaned_worktrees(&mut sessions);
+
+        assert_eq!(sessions[1].project_key, "git:git@example.com:team/example");
+        assert_eq!(sessions[1].project_root, PathBuf::from("/Users/test/codes/example"));
+        assert_eq!(
+            sessions[1].cwd,
+            PathBuf::from("/Users/test/.codex/worktrees/1234/example")
+        );
     }
 }
