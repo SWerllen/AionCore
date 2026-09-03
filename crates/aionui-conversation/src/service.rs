@@ -16,15 +16,15 @@ use crate::runtime_persistence::{RuntimePersistenceCoordinator, RuntimeWriteKind
 use crate::runtime_state::ConversationRuntimeStateService;
 use aionui_api_types::{
     ASSISTANT_MCP_BINDING_CHANGED_EVENT, ApprovalCheckResponse, AssistantConversationOverridesRequest,
-    AssistantMcpBindingChanged, CancelConversationResponse, CloneConversationRequest, ConfirmRequest,
+    AssistantMcpBindingChanged, BehaviorPolicy, CancelConversationResponse, CloneConversationRequest, ConfirmRequest,
     ConfirmationListResponse, ConversationArtifactKind, ConversationArtifactListResponse, ConversationArtifactResponse,
     ConversationArtifactStatus, ConversationListResponse, ConversationMcpStatus, ConversationMcpStatusKind,
     ConversationNameUpdatedPayload, ConversationResponse, ConversationRuntimeSummary, CreateConversationRequest,
     EnsureConversationRuntimeResponse, ForkCapabilityView, ForkConversationRequest, ListConversationsQuery,
-    ListMessagesQuery, McpRuntimeSnapshot, MessageListResponse, MessageResponse, MessageSearchResponse,
-    PromptCapabilityView, SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SessionMcpServer,
-    SessionMcpTransport, TEAM_MCP_SERVER_NAME, TeamMcpSelection, TeamSessionBinding, UpdateConversationArtifactRequest,
-    UpdateConversationRequest, WebSocketMessage, assistant_avatar_response_value,
+    ListMessagesQuery, McpPolicy, McpRuntimeSnapshot, MessageListResponse, MessageResponse, MessageSearchResponse,
+    PromptCapabilityView, STEWARD_MCP_SERVER_NAME, SearchMessagesQuery, SendMessageRequest, SendMessageResponse,
+    SessionMcpServer, SessionMcpTransport, SkillPolicy, TEAM_MCP_SERVER_NAME, TeamMcpSelection, TeamSessionBinding,
+    UpdateConversationArtifactRequest, UpdateConversationRequest, WebSocketMessage, assistant_avatar_response_value,
     assistant_avatar_response_value_with_version, assistant_mcp_binding_fingerprint,
 };
 use aionui_api_types::{ChatFileRef, SessionRef};
@@ -34,7 +34,8 @@ use aionui_common::{
     now_ms, validate_workspace_path_availability,
 };
 use aionui_db::models::{
-    AssistantDefinitionRow, ConversationAssistantSnapshotRow, ConversationRow, McpServerRow, MessageRow,
+    AgentMetadataRow, AssistantDefinitionRow, ConversationAssistantSnapshotRow, ConversationRow, McpServerRow,
+    MessageRow,
 };
 use aionui_db::{
     AgentBindingResolution, ConversationFilters, ConversationRowUpdate, CreateAcpSessionParams, IAcpSessionRepository,
@@ -62,6 +63,7 @@ use crate::session_context::{AionrsRuntimePermissionSeed, SessionContextBuilder}
 use crate::session_mentions;
 use crate::skill_resolver::SkillResolver;
 use crate::skill_snapshot::{backfill_skills_if_missing, compute_initial_skills};
+use crate::team_orchestrator::ConversationTeamOrchestrator;
 use crate::turn_orchestrator::{ConversationTurnOrchestrator, ConversationTurnStatus, TurnStartInput};
 use std::sync::RwLock;
 
@@ -331,6 +333,10 @@ pub struct ConversationService {
     assistant_preference_repo: Arc<RwLock<Option<Arc<dyn IAssistantPreferenceRepository>>>>,
     assistant_dispatcher: Arc<RwLock<Option<Arc<dyn AssistantRuleDispatcher>>>>,
     agent_availability_feedback: Arc<RwLock<Option<Arc<dyn AgentAvailabilityFeedbackPort>>>>,
+    /// Late-bound composition port for the latent Team attached to ordinary
+    /// conversations. Unit/domain tests that do not install it retain the
+    /// standalone behavior; the application installs it before serving HTTP.
+    team_orchestrator: Arc<RwLock<Option<Arc<dyn ConversationTeamOrchestrator>>>>,
     /// Project-bind side branch (optional). `None` → binding is a no-op, so
     /// conversation create/read behaves exactly as before.
     project_service: Arc<RwLock<Option<Arc<ProjectService>>>>,
@@ -416,6 +422,7 @@ impl ConversationService {
             assistant_preference_repo: Arc::new(RwLock::new(None)),
             assistant_dispatcher: Arc::new(RwLock::new(None)),
             agent_availability_feedback: Arc::new(RwLock::new(None)),
+            team_orchestrator: Arc::new(RwLock::new(None)),
             project_service: Arc::new(RwLock::new(None)),
             runtime_state: Arc::new(ConversationRuntimeStateService::default()),
             runtime_helper_bin: None,
@@ -619,6 +626,16 @@ impl ConversationService {
         }
     }
 
+    pub fn with_team_orchestrator(&self, orchestrator: Arc<dyn ConversationTeamOrchestrator>) {
+        if let Ok(mut guard) = self.team_orchestrator.write() {
+            *guard = Some(orchestrator);
+        }
+    }
+
+    fn team_orchestrator(&self) -> Option<Arc<dyn ConversationTeamOrchestrator>> {
+        self.team_orchestrator.read().ok().and_then(|guard| guard.clone())
+    }
+
     /// Register a hook to be notified when a conversation is deleted.
     ///
     /// Hooks are dispatched sequentially in registration order before
@@ -729,6 +746,10 @@ impl ConversationService {
 
     pub(crate) fn acp_session_repo(&self) -> &Arc<dyn IAcpSessionRepository> {
         &self.acp_session_repo
+    }
+
+    pub(crate) fn agent_metadata_repo(&self) -> &Arc<dyn IAgentMetadataRepository> {
+        &self.agent_metadata_repo
     }
 
     pub fn runtime_state(&self) -> Arc<ConversationRuntimeStateService> {
@@ -1238,6 +1259,14 @@ impl ConversationService {
             }
         }
 
+        let capability_policy = if effective_type == AgentType::Acp {
+            resolve_acp_behavior_policy(&self.agent_metadata_repo, user_id, &extra).await?
+        } else {
+            BehaviorPolicy::default()
+        };
+        let native_skill_policy = capability_policy.skill_policy == SkillPolicy::NativeOnly;
+        let native_mcp_policy = capability_policy.mcp_policy == McpPolicy::NativePlusTeam;
+
         // Consume transient skill-shaping inputs and freeze the initial
         // `skills` snapshot into `extra.skills`. These request-only fields
         // must not land in the stored row. Legacy names (`enabled_skills`,
@@ -1282,8 +1311,17 @@ impl ConversationService {
             None => (Vec::new(), Vec::new()),
         };
 
-        let auto_inject_names = self.skill_resolver.auto_inject_names().await;
-        let initial_skills = compute_initial_skills(&auto_inject_names, &preset_enabled, &exclude_auto_inject);
+        let initial_skills = if native_skill_policy {
+            info!(
+                conversation_id = %id,
+                suppressed_skill_count = preset_enabled.len(),
+                "conversation capability snapshot: native-only skill policy skipped AionUi skill resolution"
+            );
+            Vec::new()
+        } else {
+            let auto_inject_names = self.skill_resolver.auto_inject_names().await;
+            compute_initial_skills(&auto_inject_names, &preset_enabled, &exclude_auto_inject)
+        };
 
         // Build the per-conversation skill VIEW under AionUi's own data dir.
         //
@@ -1315,11 +1353,18 @@ impl ConversationService {
         }
 
         let is_team_conversation = extra.get("teamId").is_some();
-        let selected_mcp_server_ids = match extra.as_object_mut() {
+        // Steward conversations keep one AionUi-owned control-plane MCP while
+        // Codex/Qoder continue loading their own native MCPs and skills. This is
+        // the same narrow exception as team coordination: it does not turn the
+        // conversation into a team-owned runtime and it does not re-enable the
+        // user's ordinary AionUi MCP catalog.
+        let is_steward_conversation = extra.get("steward").and_then(serde_json::Value::as_bool) == Some(true);
+        let preserves_control_mcp = is_team_conversation || is_steward_conversation;
+        let mut selected_mcp_server_ids = match extra.as_object_mut() {
             Some(obj) => {
                 if obj.contains_key("selected_mcp_server_ids") {
                     Some(take_string_array(obj, &["selected_mcp_server_ids"]))
-                } else if is_team_conversation && obj.contains_key("mcp_server_ids") {
+                } else if preserves_control_mcp && obj.contains_key("mcp_server_ids") {
                     Some(take_string_array(obj, &["mcp_server_ids"]))
                 } else {
                     assistant_snapshot
@@ -1329,9 +1374,9 @@ impl ConversationService {
             }
             None => None,
         };
-        let selected_session_mcp_servers = match extra.as_object_mut() {
+        let mut selected_session_mcp_servers = match extra.as_object_mut() {
             Some(obj) => match obj.remove("selected_session_mcp_servers").or_else(|| {
-                (is_team_conversation)
+                (preserves_control_mcp)
                     .then(|| obj.remove("session_mcp_servers"))
                     .flatten()
             }) {
@@ -1344,7 +1389,7 @@ impl ConversationService {
             },
             None => None,
         };
-        let selected_mcp_statuses = if is_team_conversation {
+        let mut selected_mcp_statuses = if preserves_control_mcp {
             match extra.as_object_mut().and_then(|obj| obj.remove("mcp_statuses")) {
                 Some(value) => serde_json::from_value::<Vec<ConversationMcpStatus>>(value).map_err(|e| {
                     ConversationError::BadRequest {
@@ -1356,6 +1401,39 @@ impl ConversationService {
         } else {
             Vec::new()
         };
+
+        if is_steward_conversation {
+            // `steward: true` is a capability boundary, not a general escape
+            // hatch from native-MCP policy. Keep exactly the server owned by
+            // the steward control plane even if stale or client-supplied extra
+            // contains additional session MCP definitions.
+            if let Some(servers) = selected_session_mcp_servers.as_mut() {
+                servers.retain(|server| server.id == STEWARD_MCP_SERVER_NAME || server.name == STEWARD_MCP_SERVER_NAME);
+            }
+            selected_mcp_statuses
+                .retain(|status| status.id == STEWARD_MCP_SERVER_NAME || status.name == STEWARD_MCP_SERVER_NAME);
+        }
+
+        if native_mcp_policy {
+            let suppressed_mcp_count = selected_mcp_server_ids.as_ref().map_or(0, Vec::len)
+                + if preserves_control_mcp {
+                    0
+                } else {
+                    selected_session_mcp_servers.as_ref().map_or(0, Vec::len)
+                };
+            selected_mcp_server_ids = Some(Vec::new());
+            if !preserves_control_mcp {
+                selected_session_mcp_servers = Some(Vec::new());
+                selected_mcp_statuses.clear();
+            }
+            info!(
+                conversation_id = %id,
+                suppressed_mcp_count,
+                team_mcp_preserved = is_team_conversation,
+                steward_mcp_preserved = is_steward_conversation,
+                "conversation capability snapshot: native-plus-team MCP policy skipped ordinary AionUi MCP resolution"
+            );
+        }
 
         let mcp_snapshot = self
             .build_runtime_mcp_snapshot(
@@ -1520,6 +1598,49 @@ impl ConversationService {
                 .unwrap_or_default(),
                 backend: snapshot.runtime_backend.clone(),
             });
+        }
+
+        // A normal AionUi conversation is the product-level Leader. Bind its
+        // latent one-member team before returning it so the very first turn can
+        // decide to spawn registered workers without changing routes or creating
+        // a second leader conversation. The steward is control-plane only and
+        // must never receive a latent team or Team MCP. Team provisioning itself
+        // calls this same create path with `teamId`; that marker is the recursion
+        // guard.
+        let is_health_check = extra
+            .get("is_health_check")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        if !is_team_conversation
+            && !is_steward_conversation
+            && !is_health_check
+            && source == ConversationSource::Aionui
+            && let Some(orchestrator) = self.team_orchestrator()
+        {
+            if let Err(error) = orchestrator.bind_leader(user_id, &id).await {
+                warn!(
+                    conversation_id = %id,
+                    error = %ErrorChain(&error),
+                    "Embedded team leader binding failed; rolling back conversation create"
+                );
+                if let Err(cleanup_error) = self.conversation_repo.delete(user_id, &id).await {
+                    warn!(
+                        conversation_id = %id,
+                        error = %ErrorChain(&cleanup_error),
+                        "Embedded team bind rollback could not delete conversation"
+                    );
+                }
+                return Err(error);
+            }
+
+            let rebound = self
+                .conversation_repo
+                .get(user_id, &id)
+                .await?
+                .ok_or_else(|| ConversationError::internal("Conversation vanished after embedded team binding"))?;
+            let assistant_identity = response.assistant.take();
+            response = row_to_response(rebound, &self.workspace_root)?;
+            response.assistant = assistant_identity;
         }
 
         self.broadcast_list_changed(user_id, &response.id, "created", response.source.as_ref());
@@ -2432,6 +2553,206 @@ impl ConversationService {
         Ok(response)
     }
 
+    /// Replace the Assistant that owns an idle conversation while preserving
+    /// its product-level identity, messages, workspace, and control metadata.
+    ///
+    /// Provider sessions are not portable. The old runtime is terminated and
+    /// its `acp_session` row is rebuilt with the new agent identity so a Codex
+    /// resume anchor or config snapshot can never leak into Qoder (or vice
+    /// versa). Cross-agent-type replacement remains intentionally unsupported.
+    #[tracing::instrument(
+        skip_all,
+        fields(user_id = %user_id, conversation_id = %conversation_id, assistant_id = %assistant_id)
+    )]
+    pub async fn switch_assistant(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        assistant_id: &str,
+        task_manager: &Arc<dyn IWorkerTaskManager>,
+    ) -> Result<ConversationResponse, ConversationError> {
+        let assistant_id = assistant_id.trim();
+        if assistant_id.is_empty() {
+            return Err(ConversationError::BadRequest {
+                reason: "assistant_id must not be empty".into(),
+            });
+        }
+        if self.runtime_state.is_restarting(conversation_id) {
+            return Err(ConversationError::RuntimeRestarting {
+                conversation_id: conversation_id.to_owned(),
+            });
+        }
+        if self.runtime_state.active_turn_id_for(conversation_id).is_some() {
+            return Err(ConversationError::Busy {
+                reason: "Cannot switch assistant while the conversation is executing a turn".into(),
+            });
+        }
+
+        let existing = self
+            .conversation_repo
+            .get(user_id, conversation_id)
+            .await?
+            .ok_or_else(|| ConversationError::NotFound {
+                id: conversation_id.to_owned(),
+            })?;
+        let existing_type: AgentType = string_to_enum(&existing.r#type)?;
+        let mut extra: serde_json::Value = serde_json::from_str(&existing.extra)
+            .map_err(|e| ConversationError::internal(format!("Invalid conversation extra JSON: {e}")))?;
+        let snapshot = self
+            .resolve_assistant_snapshot(
+                user_id,
+                assistant_id,
+                Some("zh-CN"),
+                &AssistantConversationOverrides::default(),
+                &extra,
+            )
+            .await?
+            .ok_or_else(|| ConversationError::BadRequest {
+                reason: format!("assistant `{assistant_id}` was not found"),
+            })?;
+        if snapshot.agent_type != existing_type {
+            return Err(ConversationError::BadRequest {
+                reason: format!(
+                    "assistant `{assistant_id}` uses agent type `{}` but this conversation uses `{}`",
+                    snapshot.agent_type.serde_name(),
+                    existing_type.serde_name()
+                ),
+            });
+        }
+
+        let obj = extra
+            .as_object_mut()
+            .ok_or_else(|| ConversationError::internal("conversation extra must be an object"))?;
+        for key in [
+            "backend",
+            "agent_id",
+            "agent_source",
+            "current_model_id",
+            "current_mode_id",
+            "session_mode",
+            "thought_level",
+        ] {
+            obj.remove(key);
+        }
+        if !snapshot.runtime_backend.is_empty() {
+            obj.insert(
+                "backend".into(),
+                serde_json::Value::String(snapshot.runtime_backend.clone()),
+            );
+        }
+        if !snapshot.agent_id.is_empty() {
+            obj.insert("agent_id".into(), serde_json::Value::String(snapshot.agent_id.clone()));
+        }
+        if !snapshot.agent_source.is_empty() {
+            obj.insert(
+                "agent_source".into(),
+                serde_json::Value::String(snapshot.agent_source.clone()),
+            );
+        }
+        if let Some(model) = snapshot.resolved_defaults.model.as_ref() {
+            obj.insert("current_model_id".into(), serde_json::Value::String(model.clone()));
+        }
+        if let Some(permission) = snapshot.resolved_defaults.permission.as_ref() {
+            obj.insert("session_mode".into(), serde_json::Value::String(permission.clone()));
+            obj.insert("current_mode_id".into(), serde_json::Value::String(permission.clone()));
+        }
+        if let Some(thought_level) = snapshot.resolved_defaults.thought_level.as_ref() {
+            obj.insert("thought_level".into(), serde_json::Value::String(thought_level.clone()));
+        }
+
+        task_manager
+            .kill_and_wait(conversation_id, Some(AgentKillReason::RuntimeRestart))
+            .await;
+        self.runtime_state.clear_conversation(conversation_id);
+
+        let resolved_skill_ids = serde_json::to_string(&snapshot.resolved_defaults.skill_ids)
+            .map_err(|e| ConversationError::internal(format!("Failed to serialize assistant skill snapshot: {e}")))?;
+        let resolved_disabled_builtin_skill_ids =
+            serde_json::to_string(&snapshot.resolved_defaults.disabled_builtin_skill_ids).map_err(|e| {
+                ConversationError::internal(format!("Failed to serialize disabled builtin skill snapshot: {e}"))
+            })?;
+        let resolved_mcp_ids = serde_json::to_string(&snapshot.resolved_defaults.mcp_ids)
+            .map_err(|e| ConversationError::internal(format!("Failed to serialize assistant MCP snapshot: {e}")))?;
+        self.conversation_repo
+            .upsert_assistant_snapshot(
+                user_id,
+                &UpsertConversationAssistantSnapshotParams {
+                    conversation_id,
+                    assistant_definition_id: &snapshot.assistant_definition_id,
+                    assistant_id: &snapshot.assistant_id,
+                    assistant_source: &snapshot.assistant_source,
+                    agent_id: &snapshot.agent_id,
+                    rules_content: &snapshot.rules.content,
+                    default_model_mode: &snapshot.default_modes.model,
+                    resolved_model_id: snapshot.resolved_defaults.model.as_deref(),
+                    default_permission_mode: &snapshot.default_modes.permission,
+                    resolved_permission_value: snapshot.resolved_defaults.permission.as_deref(),
+                    default_thought_level_mode: &snapshot.default_modes.thought_level,
+                    resolved_thought_level_value: snapshot.resolved_defaults.thought_level.as_deref(),
+                    default_skills_mode: &snapshot.default_modes.skills,
+                    resolved_skill_ids: &resolved_skill_ids,
+                    resolved_disabled_builtin_skill_ids: &resolved_disabled_builtin_skill_ids,
+                    default_mcps_mode: &snapshot.default_modes.mcps,
+                    resolved_mcp_ids: &resolved_mcp_ids,
+                },
+            )
+            .await?
+            .ok_or_else(|| ConversationError::internal("assistant snapshot upsert returned no row"))?;
+
+        self.conversation_repo
+            .update(
+                user_id,
+                conversation_id,
+                &ConversationRowUpdate {
+                    extra: Some(serde_json::to_string(&extra).map_err(|e| {
+                        ConversationError::internal(format!("Failed to serialize conversation extra: {e}"))
+                    })?),
+                    updated_at: Some(now_ms()),
+                    ..Default::default()
+                },
+            )
+            .await?;
+
+        if matches!(existing_type, AgentType::Acp | AgentType::Antigravity) {
+            self.acp_session_repo
+                .delete_for_user(user_id, conversation_id)
+                .await
+                .map_err(|e| ConversationError::internal(format!("Failed to clear old ACP session: {e}")))?;
+            self.create_acp_session_row(user_id, conversation_id, &extra, Some(&snapshot))
+                .await?;
+        }
+        self.persist_assistant_preferences_from_snapshot(user_id, &snapshot)
+            .await?;
+
+        if let Some((team_id, _slot_id)) = embedded_team_binding_from_extra(&existing.extra) {
+            let Some(orchestrator) = self.team_orchestrator() else {
+                return Err(ConversationError::internal(
+                    "embedded team conversation is missing its application orchestrator",
+                ));
+            };
+            orchestrator
+                .sync_leader_identity(user_id, conversation_id, &team_id)
+                .await?;
+        }
+
+        let previous_backend = serde_json::from_str::<serde_json::Value>(&existing.extra)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("backend")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+            .unwrap_or_default();
+        info!(
+            previous_backend,
+            backend = %snapshot.runtime_backend,
+            "Conversation assistant source switched"
+        );
+        self.broadcast_list_changed(user_id, conversation_id, "updated", None);
+        self.get(user_id, conversation_id).await
+    }
+
     /// Merge a JSON patch into `conversation.extra` without touching model,
     /// name, pinned flag, or task lifecycle. Intended for internal callers
     /// (e.g. `TeamSessionService::ensure_session` writing
@@ -2472,6 +2793,51 @@ impl ConversationService {
             .await?;
         debug!("Conversation extra merged");
         Ok(())
+    }
+
+    /// Merge a JSON patch into `conversation.extra`, but skip the database
+    /// write when the persisted value already contains the same snapshot.
+    /// This is useful for idempotent control-plane repair paths that run on
+    /// reads and must not continually bump conversation recency.
+    #[tracing::instrument(skip_all, fields(user_id = %user_id, conversation_id = %conversation_id))]
+    pub async fn update_extra_if_changed(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        patch: serde_json::Value,
+    ) -> Result<bool, ConversationError> {
+        let existing = self
+            .conversation_repo
+            .get(user_id, conversation_id)
+            .await?
+            .ok_or_else(|| ConversationError::NotFound {
+                id: conversation_id.to_owned(),
+            })?;
+
+        let mut merged: serde_json::Value =
+            serde_json::from_str(&existing.extra).unwrap_or_else(|_| serde_json::json!({}));
+        let before = merged.clone();
+        merge_json(&mut merged, &patch);
+        if patch.get("workspace").is_some() {
+            normalize_workspace_extra(&mut merged)?;
+        }
+        if merged == before {
+            return Ok(false);
+        }
+
+        let updates = ConversationRowUpdate {
+            extra: Some(
+                serde_json::to_string(&merged)
+                    .map_err(|e| ConversationError::internal(format!("Failed to serialize merged extra: {e}")))?,
+            ),
+            updated_at: Some(now_ms()),
+            ..Default::default()
+        };
+        self.conversation_repo
+            .update(user_id, conversation_id, &updates)
+            .await?;
+        debug!("Conversation extra changed and merged");
+        Ok(true)
     }
 
     pub async fn save_acp_runtime_mode(
@@ -2572,6 +2938,14 @@ impl ConversationService {
             .source
             .as_deref()
             .and_then(|s| string_to_enum::<ConversationSource>(s).ok());
+        if let Some((team_id, _slot_id)) = embedded_team_binding_from_extra(&existing.extra) {
+            let Some(orchestrator) = self.team_orchestrator() else {
+                return Err(ConversationError::internal(
+                    "embedded team conversation is missing its application orchestrator",
+                ));
+            };
+            orchestrator.remove_for_leader(user_id, id, &team_id).await?;
+        }
         let mut auto_workspace_to_delete = auto_provisioned_workspace_to_delete(&self.workspace_root, &existing, id);
         // Shared-workspace guard: a forked conversation inherits the parent's
         // auto workspace verbatim (claude keys on-disk sessions by cwd), so
@@ -3829,6 +4203,7 @@ impl ConversationService {
                 reason: "Team-owned conversations must be sent through Team API".into(),
             });
         }
+        let embedded_team = embedded_team_binding_from_extra(&row.extra);
 
         reject_deprecated_runtime_row(&row)?;
 
@@ -3864,6 +4239,46 @@ impl ConversationService {
         let resolved = self
             .resolve_message_attachments(user_id, &content_with_sessions, &req.files)
             .await?;
+
+        if let Some((team_id, _slot_id)) = embedded_team {
+            let Some(orchestrator) = self.team_orchestrator() else {
+                return Err(ConversationError::internal(
+                    "embedded team conversation is missing its application orchestrator",
+                ));
+            };
+            if req.hidden || !req.inject_skills.is_empty() {
+                warn!(
+                    conversation_id,
+                    team_id,
+                    hidden = req.hidden,
+                    inject_skill_count = req.inject_skills.len(),
+                    "Embedded team send received conversation-only delivery options; scheduling the visible user turn"
+                );
+            }
+            let ack = orchestrator
+                .send_message(
+                    user_id,
+                    conversation_id,
+                    &team_id,
+                    &content_with_sessions,
+                    req.files.clone(),
+                )
+                .await?;
+            info!(
+                conversation_id,
+                team_id,
+                msg_id = %ack.message_id,
+                team_run_id = %ack.team_run_id,
+                elapsed_ms = now_ms().saturating_sub(send_started_at),
+                "Message accepted by embedded team leader"
+            );
+            return Ok(SendMessageResponse {
+                msg_id: ack.message_id,
+                turn_id: ack.team_run_id,
+                delivered_midturn: false,
+                runtime: self.runtime_summary_for(conversation_id).await,
+            });
+        }
 
         // ── Mid-turn delivery (B5, spec §4.3) ────────────────────────────
         // An ACTIVE turn + a backend that supports mid-turn delivery → the
@@ -4262,6 +4677,20 @@ impl ConversationService {
     pub async fn insert_raw_message(&self, user_id: &str, row: &MessageRow) -> Result<(), ConversationError> {
         self.conversation_repo.insert_message(user_id, row).await?;
 
+        self.broadcast_raw_message(user_id, row);
+        Ok(())
+    }
+
+    /// Idempotent variant used by durable outbox consumers. A crash after the
+    /// message insert but before the outbox checkpoint can replay this safely.
+    pub async fn upsert_raw_message(&self, user_id: &str, row: &MessageRow) -> Result<(), ConversationError> {
+        self.conversation_repo.upsert_message(user_id, row).await?;
+
+        self.broadcast_raw_message(user_id, row);
+        Ok(())
+    }
+
+    fn broadcast_raw_message(&self, user_id: &str, row: &MessageRow) {
         let msg_id = row.msg_id.clone().unwrap_or_else(|| row.id.clone());
         let content_value: serde_json::Value =
             serde_json::from_str(&row.content).unwrap_or_else(|_| serde_json::Value::String(row.content.clone()));
@@ -4274,11 +4703,11 @@ impl ConversationService {
             "position": row.position,
             "status": row.status,
             "hidden": row.hidden,
+            "created_at": row.created_at,
             "replace": true,
         });
         self.broadcaster
             .broadcast(WebSocketMessage::new("message.stream", payload));
-        Ok(())
     }
 
     /// Stop the current streaming response for a conversation.
@@ -4329,6 +4758,26 @@ impl ConversationService {
         turn_id: &str,
         task_manager: &Arc<dyn IWorkerTaskManager>,
     ) -> Result<CancelConversationResponse, ConversationError> {
+        let row = self
+            .conversation_repo
+            .get(user_id, conversation_id)
+            .await?
+            .ok_or_else(|| ConversationError::NotFound {
+                id: conversation_id.to_owned(),
+            })?;
+        if let Some((team_id, _slot_id)) = embedded_team_binding_from_extra(&row.extra) {
+            let Some(orchestrator) = self.team_orchestrator() else {
+                return Err(ConversationError::internal(
+                    "embedded team conversation is missing its application orchestrator",
+                ));
+            };
+            orchestrator
+                .cancel_run(user_id, conversation_id, &team_id, turn_id)
+                .await?;
+            return Ok(CancelConversationResponse {
+                runtime: self.runtime_summary_for(conversation_id).await,
+            });
+        }
         self.cancel_with_cause(
             user_id,
             conversation_id,
@@ -4468,6 +4917,17 @@ impl ConversationService {
             });
         };
 
+        if let Some((team_id, _slot_id)) = embedded_team_binding_from_extra(&row.extra) {
+            let Some(orchestrator) = self.team_orchestrator() else {
+                return Err(ConversationError::internal(
+                    "embedded team conversation is missing its application orchestrator",
+                ));
+            };
+            return orchestrator
+                .renew_active_lease(user_id, conversation_id, &team_id)
+                .await;
+        }
+
         let expires_at = active_leases.renew(&row.id);
         debug!(
             kind = "conversation",
@@ -4510,6 +4970,38 @@ impl ConversationService {
             .ok_or_else(|| ConversationError::NotFound {
                 id: conversation_id.to_owned(),
             })?;
+        if let Some((team_id, _slot_id)) = embedded_team_binding_from_extra(&row.extra) {
+            let Some(orchestrator) = self.team_orchestrator() else {
+                return Err(ConversationError::internal(
+                    "embedded team conversation is missing its application orchestrator",
+                ));
+            };
+            orchestrator.ensure_runtime(user_id, conversation_id, &team_id).await?;
+            let agent =
+                task_manager
+                    .get_task(conversation_id)
+                    .ok_or_else(|| ConversationError::ActiveAgentNotFound {
+                        conversation_id: conversation_id.to_owned(),
+                    })?;
+            let config_options = agent
+                .get_config_options()
+                .await
+                .map_err(ConversationError::from)?
+                .config_options;
+            let config_options = self
+                .augment_qoder_context_window_options_for_conversation(
+                    user_id,
+                    conversation_id,
+                    &row.extra,
+                    config_options,
+                )
+                .await?;
+            return Ok(EnsureConversationRuntimeResponse {
+                recovered: false,
+                config_options,
+                runtime: self.runtime_summary_for(conversation_id).await,
+            });
+        }
         if let Some(team_id) = team_id_from_extra(&row.extra) {
             info!(
                 conversation_id,
@@ -4529,6 +5021,9 @@ impl ConversationService {
             .await
             .map_err(ConversationError::from)?
             .config_options;
+        let config_options = self
+            .augment_qoder_context_window_options_for_conversation(user_id, conversation_id, &row.extra, config_options)
+            .await?;
 
         Ok(EnsureConversationRuntimeResponse {
             recovered,
@@ -4556,6 +5051,40 @@ impl ConversationService {
             .ok_or_else(|| ConversationError::NotFound {
                 id: conversation_id.to_owned(),
             })?;
+        if let Some((team_id, slot_id)) = embedded_team_binding_from_extra(&row.extra) {
+            let Some(orchestrator) = self.team_orchestrator() else {
+                return Err(ConversationError::internal(
+                    "embedded team conversation is missing its application orchestrator",
+                ));
+            };
+            orchestrator
+                .restart_runtime(user_id, conversation_id, &team_id, &slot_id)
+                .await?;
+            let agent =
+                task_manager
+                    .get_task(conversation_id)
+                    .ok_or_else(|| ConversationError::ActiveAgentNotFound {
+                        conversation_id: conversation_id.to_owned(),
+                    })?;
+            let config_options = agent
+                .get_config_options()
+                .await
+                .map_err(ConversationError::from)?
+                .config_options;
+            let config_options = self
+                .augment_qoder_context_window_options_for_conversation(
+                    user_id,
+                    conversation_id,
+                    &row.extra,
+                    config_options,
+                )
+                .await?;
+            return Ok(EnsureConversationRuntimeResponse {
+                recovered: true,
+                config_options,
+                runtime: self.runtime_summary_for(conversation_id).await,
+            });
+        }
         if let Some(team_id) = team_id_from_extra(&row.extra) {
             info!(
                 conversation_id,
@@ -4621,6 +5150,9 @@ impl ConversationService {
         .await;
         self.runtime_state.clear_restarting(conversation_id);
         let (recovered, config_options) = restart_result?;
+        let config_options = self
+            .augment_qoder_context_window_options_for_conversation(user_id, conversation_id, &row.extra, config_options)
+            .await?;
 
         Ok(EnsureConversationRuntimeResponse {
             recovered,
@@ -5063,6 +5595,24 @@ fn team_id_from_extra(extra: &str) -> Option<String> {
     TeamSessionBinding::team_id_marker_from_extra_str(extra)
 }
 
+fn embedded_team_binding_from_extra(extra: &str) -> Option<(String, String)> {
+    let value: serde_json::Value = serde_json::from_str(extra).ok()?;
+    let team_id = value
+        .get("embedded_team_id")
+        .or_else(|| value.get("embeddedTeamId"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?
+        .to_owned();
+    let slot_id = value
+        .get("slot_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?
+        .to_owned();
+    Some((team_id, slot_id))
+}
+
 fn normalize_workspace_path(workspace: &str) -> Result<String, ConversationError> {
     validate_workspace_path_availability(workspace).map_err(map_create_workspace_validation_error)
 }
@@ -5473,12 +6023,50 @@ impl ConversationService {
             return Ok(None);
         };
         let fingerprint = assistant_mcp_binding_fingerprint(&selection.selected_ids);
+        let mut session_mcp_servers = selection.session_mcp_servers;
+        let mut mcp_statuses = selection.mcp_statuses;
+        if extra.get("steward").and_then(serde_json::Value::as_bool) == Some(true) {
+            // Embedded-team startup refreshes the assistant MCP snapshot before
+            // the leader runtime is built. The steward control MCP is owned by
+            // the conversation, not by the assistant, so merge that one
+            // persisted server back into the refreshed assistant selection.
+            // Without this, first launch silently erases the steward's tools.
+            let persisted_servers = extra
+                .get("session_mcp_servers")
+                .or_else(|| extra.get("selected_session_mcp_servers"))
+                .cloned()
+                .and_then(|value| serde_json::from_value::<Vec<SessionMcpServer>>(value).ok())
+                .unwrap_or_default();
+            for server in persisted_servers {
+                if (server.id == STEWARD_MCP_SERVER_NAME || server.name == STEWARD_MCP_SERVER_NAME)
+                    && !session_mcp_servers.iter().any(|existing| {
+                        existing.id == STEWARD_MCP_SERVER_NAME || existing.name == STEWARD_MCP_SERVER_NAME
+                    })
+                {
+                    session_mcp_servers.push(server);
+                }
+            }
+            let persisted_statuses = extra
+                .get("mcp_statuses")
+                .cloned()
+                .and_then(|value| serde_json::from_value::<Vec<ConversationMcpStatus>>(value).ok())
+                .unwrap_or_default();
+            for status in persisted_statuses {
+                if (status.id == STEWARD_MCP_SERVER_NAME || status.name == STEWARD_MCP_SERVER_NAME)
+                    && !mcp_statuses.iter().any(|existing| {
+                        existing.id == STEWARD_MCP_SERVER_NAME || existing.name == STEWARD_MCP_SERVER_NAME
+                    })
+                {
+                    mcp_statuses.push(status);
+                }
+            }
+        }
         let snapshot = self
             .build_runtime_mcp_snapshot(
                 user_id,
                 Some(&selection.mcp_server_ids),
-                &selection.session_mcp_servers,
-                &selection.mcp_statuses,
+                &session_mcp_servers,
+                &mcp_statuses,
                 agent_type,
                 extra,
             )
@@ -5515,33 +6103,11 @@ async fn resolve_acp_mcp_support_policy(
     user_id: &str,
     extra: &serde_json::Value,
 ) -> Result<McpSupportPolicy, ConversationError> {
-    let agent_id = extra
-        .get("agent_id")
-        .and_then(serde_json::Value::as_str)
-        .filter(|s| !s.is_empty());
     let backend = extra
         .get("backend")
         .and_then(serde_json::Value::as_str)
         .filter(|s| !s.is_empty());
-    let agent_source = extra
-        .get("agent_source")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("builtin");
-
-    let row = match agent_id {
-        Some(id) => repo
-            .get_for_user(user_id, id)
-            .await
-            .map_err(|e| ConversationError::internal(format!("agent_metadata lookup: {e}")))?,
-        None if agent_source == "builtin" => match backend {
-            Some(vendor) => repo
-                .find_builtin_by_backend_for_user(user_id, vendor)
-                .await
-                .map_err(|e| ConversationError::internal(format!("agent_metadata lookup: {e}")))?,
-            None => None,
-        },
-        None => None,
-    };
+    let row = resolve_acp_agent_metadata_row(repo, user_id, extra).await?;
 
     let persisted = row
         .as_ref()
@@ -5558,6 +6124,65 @@ async fn resolve_acp_mcp_support_policy(
         .unwrap_or_default();
 
     Ok(McpSupportPolicy::from_acp_capabilities(capabilities))
+}
+
+async fn resolve_acp_behavior_policy(
+    repo: &Arc<dyn IAgentMetadataRepository>,
+    user_id: &str,
+    extra: &serde_json::Value,
+) -> Result<BehaviorPolicy, ConversationError> {
+    let Some(row) = resolve_acp_agent_metadata_row(repo, user_id, extra).await? else {
+        return Ok(BehaviorPolicy::default());
+    };
+    let Some(raw) = row.behavior_policy.as_deref() else {
+        return Ok(BehaviorPolicy::default());
+    };
+
+    match serde_json::from_str(raw) {
+        Ok(policy) => Ok(policy),
+        Err(error) => {
+            warn!(
+                agent_id = %row.id,
+                error = %error,
+                "agent behavior policy is malformed; using managed capability defaults"
+            );
+            Ok(BehaviorPolicy::default())
+        }
+    }
+}
+
+async fn resolve_acp_agent_metadata_row(
+    repo: &Arc<dyn IAgentMetadataRepository>,
+    user_id: &str,
+    extra: &serde_json::Value,
+) -> Result<Option<AgentMetadataRow>, ConversationError> {
+    let agent_id = extra
+        .get("agent_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty());
+    let backend = extra
+        .get("backend")
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty());
+    let agent_source = extra
+        .get("agent_source")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("builtin");
+
+    Ok(match agent_id {
+        Some(id) => repo
+            .get_for_user(user_id, id)
+            .await
+            .map_err(|e| ConversationError::internal(format!("agent_metadata lookup: {e}")))?,
+        None if agent_source == "builtin" => match backend {
+            Some(vendor) => repo
+                .find_builtin_by_backend_for_user(user_id, vendor)
+                .await
+                .map_err(|e| ConversationError::internal(format!("agent_metadata lookup: {e}")))?,
+            None => None,
+        },
+        None => None,
+    })
 }
 
 fn upsert_conversation_mcp_status(

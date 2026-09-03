@@ -88,6 +88,7 @@ fn make_text_message(user_id: &str, chat_id: &str, text: &str) -> UnifiedIncomin
         id: format!("msg_{}", now_ms()),
         platform: PluginType::Telegram,
         chat_id: chat_id.into(),
+        is_group: false,
         user: UnifiedUser {
             id: user_id.into(),
             username: None,
@@ -117,6 +118,7 @@ fn make_action_message(
         id: format!("msg_{}", now_ms()),
         platform: PluginType::Telegram,
         chat_id: chat_id.into(),
+        is_group: false,
         user: UnifiedUser {
             id: user_id.into(),
             username: None,

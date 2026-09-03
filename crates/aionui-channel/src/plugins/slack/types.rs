@@ -179,6 +179,7 @@ pub(super) fn event_to_unified(event: &SlackEvent, bot_user_id: &str) -> Option<
     }
 
     let channel = event.channel.clone()?;
+    let is_group = event.channel_type.as_deref() != Some("im") && !channel.starts_with('D');
     let user_id = event.user.clone().unwrap_or_default();
     let ts = event.ts.clone().unwrap_or_default();
 
@@ -200,6 +201,7 @@ pub(super) fn event_to_unified(event: &SlackEvent, bot_user_id: &str) -> Option<
         id,
         platform: PluginType::Slack,
         chat_id: channel,
+        is_group,
         user: UnifiedUser {
             id: user_id,
             username: None,

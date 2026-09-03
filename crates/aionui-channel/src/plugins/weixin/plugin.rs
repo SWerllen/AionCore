@@ -353,6 +353,7 @@ async fn handle_message(
         id: msg.msg_id.clone().unwrap_or_default(),
         platform: PluginType::Weixin,
         chat_id: from_user_id.clone(),
+        is_group: false,
         user: UnifiedUser {
             id: from_user_id,
             username: None,

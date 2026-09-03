@@ -12,7 +12,8 @@ use std::path::Component;
 
 use aionui_ai_agent::{AcpError, AgentError};
 use aionui_api_types::{
-    ConfigOptionConfirmation, GetConfigOptionsResponse, SetConfigOptionRequest, SetConfigOptionResponse,
+    AcpConfigOptionDto, AcpConfigSelectOptionDto, ConfigOptionConfirmation, GetConfigOptionsResponse,
+    NativeGoalStateResponse, SetConfigOptionRequest, SetConfigOptionResponse, SetNativeGoalRequest,
     SideQuestionRequest, SideQuestionResponse, SlashCommandItem, WorkspaceBrowseQuery, WorkspaceEntry,
 };
 use aionui_common::{AgentKillReason, ErrorChain};
@@ -23,9 +24,239 @@ use crate::ConversationError;
 use crate::service::{AssistantRuntimePreferenceUpdate, ConversationService};
 
 const MAX_DIR_DEPTH: usize = 10;
+const QODER_CONTEXT_WINDOW_OPTION_ID: &str = "context_window";
+const QODER_CONTEXT_WINDOW_DEFAULT: &str = "default";
+
+fn format_context_window(value: u64) -> String {
+    if value >= 1_000_000 && value % 1_000_000 == 0 {
+        format!("{}M", value / 1_000_000)
+    } else if value >= 1_000 && value % 1_000 == 0 {
+        format!("{}K", value / 1_000)
+    } else {
+        value.to_string()
+    }
+}
+
+pub(crate) fn context_windows_for_model(available_models: &str, selected_model: Option<&str>) -> Vec<u64> {
+    let Ok(catalog) = serde_json::from_str::<serde_json::Value>(available_models) else {
+        return Vec::new();
+    };
+    let selected_model = selected_model.filter(|value| !value.trim().is_empty()).or_else(|| {
+        catalog
+            .get("current_model_id")
+            .or_else(|| catalog.get("currentModelId"))
+            .and_then(serde_json::Value::as_str)
+    });
+    let Some(selected_model) = selected_model else {
+        return Vec::new();
+    };
+    let Some(models) = catalog
+        .get("available_models")
+        .or_else(|| catalog.get("availableModels"))
+        .and_then(serde_json::Value::as_array)
+    else {
+        return Vec::new();
+    };
+    let Some(model) = models.iter().find(|model| {
+        model
+            .get("id")
+            .or_else(|| model.get("modelId"))
+            .and_then(serde_json::Value::as_str)
+            == Some(selected_model)
+    }) else {
+        return Vec::new();
+    };
+    let mut windows = Vec::new();
+    if let Some(values) = model
+        .get("available_context_windows")
+        .or_else(|| model.get("availableContextWindows"))
+        .and_then(serde_json::Value::as_array)
+    {
+        for value in values
+            .iter()
+            .filter_map(serde_json::Value::as_u64)
+            .filter(|value| *value > 0)
+        {
+            if !windows.contains(&value) {
+                windows.push(value);
+            }
+        }
+    }
+    windows
+}
 
 impl ConversationService {
     // ── Config Options ──────────────────────────────────────────────
+
+    /// Qoder supports `--context-window` in its native CLI, but its ACP
+    /// `session/config_option` surface currently omits that setting. Project a
+    /// small AionUi-owned option into the otherwise provider-owned snapshot;
+    /// setting it persists the launch flag and recycles only this runtime.
+    pub(crate) fn augment_qoder_context_window_options(
+        extra: &str,
+        context_windows: &[u64],
+        mut config_options: Vec<AcpConfigOptionDto>,
+    ) -> Vec<AcpConfigOptionDto> {
+        let extra: serde_json::Value = serde_json::from_str(extra).unwrap_or(serde_json::Value::Null);
+        if extra.get("backend").and_then(serde_json::Value::as_str) != Some("qoder") {
+            return config_options;
+        }
+        let current_value = extra
+            .get(QODER_CONTEXT_WINDOW_OPTION_ID)
+            .and_then(serde_json::Value::as_u64)
+            .filter(|value| context_windows.contains(value))
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| QODER_CONTEXT_WINDOW_DEFAULT.to_owned());
+        config_options.retain(|option| option.id != QODER_CONTEXT_WINDOW_OPTION_ID);
+        let mut options = vec![AcpConfigSelectOptionDto {
+            value: QODER_CONTEXT_WINDOW_DEFAULT.to_owned(),
+            name: Some("Default".to_owned()),
+            label: Some("Default".to_owned()),
+            description: None,
+        }];
+        options.extend(context_windows.iter().copied().map(|value| {
+            let label = format_context_window(value);
+            AcpConfigSelectOptionDto {
+                value: value.to_string(),
+                name: Some(label.clone()),
+                label: Some(label),
+                description: None,
+            }
+        }));
+        config_options.push(AcpConfigOptionDto {
+            id: QODER_CONTEXT_WINDOW_OPTION_ID.to_owned(),
+            name: None,
+            label: None,
+            description: None,
+            category: Some(QODER_CONTEXT_WINDOW_OPTION_ID.to_owned()),
+            option_type: "select".to_owned(),
+            current_value: Some(current_value),
+            options,
+        });
+        config_options
+    }
+
+    async fn qoder_context_windows(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        extra: &str,
+        selected_model: Option<&str>,
+    ) -> Result<Vec<u64>, ConversationError> {
+        let extra: serde_json::Value = serde_json::from_str(extra).unwrap_or(serde_json::Value::Null);
+        if extra.get("backend").and_then(serde_json::Value::as_str) != Some("qoder") {
+            return Ok(Vec::new());
+        }
+        let session = self.acp_session_repo().get_for_user(user_id, conversation_id).await?;
+        let Some(session) = session else {
+            return Ok(Vec::new());
+        };
+        let metadata = self
+            .agent_metadata_repo()
+            .get_for_user(user_id, &session.agent_id)
+            .await?;
+        let Some(available_models) = metadata.and_then(|row| row.available_models) else {
+            return Ok(Vec::new());
+        };
+        let runtime_model = self
+            .acp_session_repo()
+            .load_runtime_state_for_user(user_id, conversation_id)
+            .await?
+            .and_then(|state| {
+                state
+                    .config_selections_json
+                    .as_deref()
+                    .and_then(|raw| serde_json::from_str::<HashMap<String, String>>(raw).ok())
+                    .and_then(|selections| selections.get("model").cloned())
+                    .or(state.current_model_id)
+            });
+        let extra_model = extra
+            .get("current_model_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        Ok(context_windows_for_model(
+            &available_models,
+            selected_model.or(runtime_model.as_deref()).or(extra_model.as_deref()),
+        ))
+    }
+
+    pub(crate) async fn augment_qoder_context_window_options_for_conversation(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        extra: &str,
+        config_options: Vec<AcpConfigOptionDto>,
+    ) -> Result<Vec<AcpConfigOptionDto>, ConversationError> {
+        let context_windows = self
+            .qoder_context_windows(user_id, conversation_id, extra, None)
+            .await?;
+        Ok(Self::augment_qoder_context_window_options(
+            extra,
+            &context_windows,
+            config_options,
+        ))
+    }
+
+    async fn qoder_extra(&self, user_id: &str, conversation_id: &str) -> Result<Option<String>, ConversationError> {
+        let row = self
+            .conversation_repo()
+            .get(user_id, conversation_id)
+            .await?
+            .ok_or_else(|| ConversationError::NotFound {
+                id: conversation_id.to_owned(),
+            })?;
+        let extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap_or(serde_json::Value::Null);
+        Ok((extra.get("backend").and_then(serde_json::Value::as_str) == Some("qoder")).then_some(row.extra))
+    }
+
+    async fn set_qoder_context_window(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        value: &str,
+    ) -> Result<SetConfigOptionResponse, ConversationError> {
+        let extra = self
+            .qoder_extra(user_id, conversation_id)
+            .await?
+            .ok_or_else(|| ConversationError::BadRequest {
+                reason: "context window is only supported by Qoder conversations".to_owned(),
+            })?;
+        let context_windows = self
+            .qoder_context_windows(user_id, conversation_id, &extra, None)
+            .await?;
+        let context_window = if value == QODER_CONTEXT_WINDOW_DEFAULT {
+            None
+        } else {
+            let value = value.parse::<u64>().map_err(|_| ConversationError::BadRequest {
+                reason: "invalid Qoder context window".to_owned(),
+            })?;
+            if !context_windows.contains(&value) {
+                return Err(ConversationError::BadRequest {
+                    reason: format!("unsupported Qoder context window for the selected model: {value}"),
+                });
+            }
+            Some(value)
+        };
+        if self.runtime_state().active_turn_id_for(conversation_id).is_some() {
+            return Err(ConversationError::Busy {
+                reason: "context window can only be changed while the conversation is idle".to_owned(),
+            });
+        }
+
+        self.update_extra(
+            user_id,
+            conversation_id,
+            serde_json::json!({ (QODER_CONTEXT_WINDOW_OPTION_ID): context_window }),
+        )
+        .await?;
+        let restarted = self
+            .restart_runtime(user_id, conversation_id, self.task_manager())
+            .await?;
+        Ok(SetConfigOptionResponse {
+            confirmation: ConfigOptionConfirmation::Observed,
+            config_options: Some(restarted.config_options),
+        })
+    }
 
     pub async fn get_config_options(
         &self,
@@ -38,10 +269,23 @@ impl ConversationService {
                 conversation_id: conversation_id.to_owned(),
             });
         }
-        self.task(conversation_id)?
+        let response = self
+            .task(conversation_id)?
             .get_config_options()
             .await
-            .map_err(ConversationError::from)
+            .map_err(ConversationError::from)?;
+        let qoder_extra = self.qoder_extra(user_id, conversation_id).await?;
+        Ok(GetConfigOptionsResponse {
+            config_options: match qoder_extra {
+                Some(extra) => {
+                    let windows = self
+                        .qoder_context_windows(user_id, conversation_id, &extra, None)
+                        .await?;
+                    Self::augment_qoder_context_window_options(&extra, &windows, response.config_options)
+                }
+                None => response.config_options,
+            },
+        })
     }
 
     /// Return the last model selection that was confirmed by the runtime.
@@ -170,8 +414,13 @@ impl ConversationService {
                 conversation_id: conversation_id.to_owned(),
             });
         }
+        if option_id == QODER_CONTEXT_WINDOW_OPTION_ID && self.qoder_extra(user_id, conversation_id).await?.is_some() {
+            return self
+                .set_qoder_context_window(user_id, conversation_id, req.value.trim())
+                .await;
+        }
         let agent = self.task(conversation_id)?;
-        let response = match agent.set_config_option(option_id, &req.value).await {
+        let mut response = match agent.set_config_option(option_id, &req.value).await {
             Ok(response) => response,
             Err(err @ AgentError::Acp(AcpError::NotConnected)) => {
                 warn!(
@@ -254,6 +503,23 @@ impl ConversationService {
             }
         }
 
+        if let Some(extra) = self.qoder_extra(user_id, conversation_id).await?
+            && let Some(config_options) = response.config_options.take()
+        {
+            let selected_model = config_options
+                .iter()
+                .find(|option| option.id == option_id)
+                .and_then(|option| (option.id == "model").then_some(req.value.as_str()));
+            let context_windows = self
+                .qoder_context_windows(user_id, conversation_id, &extra, selected_model)
+                .await?;
+            response.config_options = Some(Self::augment_qoder_context_window_options(
+                &extra,
+                &context_windows,
+                config_options,
+            ));
+        }
+
         Ok(response)
     }
 
@@ -294,6 +560,92 @@ impl ConversationService {
             .get_slash_commands()
             .await
             .map_err(ConversationError::from)
+    }
+
+    // ── Provider-native goals ──────────────────────────────────────
+
+    pub async fn get_native_goal(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<NativeGoalStateResponse, ConversationError> {
+        self.ensure_owned_conversation(user_id, conversation_id).await?;
+        let state = self
+            .task(conversation_id)?
+            .get_native_goal()
+            .await
+            .map_err(ConversationError::from)?;
+        tracing::info!(
+            conversation_id,
+            provider = %state.provider,
+            supported = state.capabilities.supported,
+            control_mode = ?state.capabilities.control_mode,
+            goal_present = state.goal.is_some(),
+            "provider_native_goal_read"
+        );
+        Ok(state)
+    }
+
+    pub async fn set_native_goal(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        request: SetNativeGoalRequest,
+    ) -> Result<NativeGoalStateResponse, ConversationError> {
+        self.ensure_owned_conversation(user_id, conversation_id).await?;
+        if request.clear_token_budget && request.token_budget.is_some() {
+            return Err(ConversationError::BadRequest {
+                reason: "token_budget and clear_token_budget cannot be used together".into(),
+            });
+        }
+        if let Some(objective) = request.objective.as_deref()
+            && objective.trim().is_empty()
+        {
+            return Err(ConversationError::BadRequest {
+                reason: "objective must not be empty".into(),
+            });
+        }
+        if request.objective.is_none()
+            && request.status.is_none()
+            && request.token_budget.is_none()
+            && !request.clear_token_budget
+        {
+            return Err(ConversationError::BadRequest {
+                reason: "native goal update requires objective, status, or token_budget".into(),
+            });
+        }
+        let state = self
+            .task(conversation_id)?
+            .set_native_goal(&request)
+            .await
+            .map_err(ConversationError::from)?;
+        tracing::info!(
+            conversation_id,
+            provider = %state.provider,
+            status = ?state.goal.as_ref().map(|goal| goal.status),
+            "provider_native_goal_set"
+        );
+        Ok(state)
+    }
+
+    pub async fn clear_native_goal(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<NativeGoalStateResponse, ConversationError> {
+        self.ensure_owned_conversation(user_id, conversation_id).await?;
+        let state = self
+            .task(conversation_id)?
+            .clear_native_goal()
+            .await
+            .map_err(ConversationError::from)?;
+        tracing::info!(
+            conversation_id,
+            provider = %state.provider,
+            cleared = state.cleared.unwrap_or(false),
+            "provider_native_goal_cleared"
+        );
+        Ok(state)
     }
 
     // ── Side question ───────────────────────────────────────────────

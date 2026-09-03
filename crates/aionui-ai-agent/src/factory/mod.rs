@@ -109,6 +109,16 @@ pub(crate) async fn resolve_skill_delivery(
     skills: &[String],
     metadata: &aionui_api_types::AgentMetadata,
 ) -> ResolvedSkillDelivery {
+    if metadata.behavior_policy.skill_policy == aionui_api_types::SkillPolicy::NativeOnly {
+        tracing::info!(
+            conversation_id,
+            backend = metadata.backend.as_deref().unwrap_or("unknown"),
+            suppressed_skills = skills.len(),
+            "skill_delivery: native-only policy preserves the agent's own skill discovery"
+        );
+        return ResolvedSkillDelivery::default();
+    }
+
     let skill_dirs = deps.skill_manager.resolve_skill_dirs_for_user(user_id, skills).await;
 
     // A rejected id yields no view path. `plan_skill_delivery` then contributes

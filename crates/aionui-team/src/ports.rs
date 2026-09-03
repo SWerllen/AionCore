@@ -159,6 +159,20 @@ pub struct TeamAssistantCatalogEntry {
     pub backend: String,
     pub description: String,
     pub skills: Vec<String>,
+    pub worker_profiles: Vec<TeamWorkerProfile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TeamWorkerProfile {
+    pub worker_profile_id: String,
+    pub name: String,
+    pub model_id: String,
+    pub reasoning_effort: Option<String>,
+    pub context_window: Option<u64>,
+    pub difficulty_ceiling: u8,
+    pub estimated_cost_micros: i64,
+    pub currency: String,
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

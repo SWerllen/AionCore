@@ -1,9 +1,9 @@
 #![allow(clippy::disallowed_types)]
 
-use crate::state::ConversationRouterState;
+use crate::{StewardService, state::ConversationRouterState};
 use aionui_api_types::{
-    ApiResponse, SetConfigOptionRequest, SetConfigOptionResponse, SideQuestionRequest, SideQuestionResponse,
-    SlashCommandItem, WorkspaceBrowseQuery, WorkspaceEntry,
+    ApiResponse, NativeGoalStateResponse, SetConfigOptionRequest, SetConfigOptionResponse, SetNativeGoalRequest,
+    SideQuestionRequest, SideQuestionResponse, SlashCommandItem, WorkspaceBrowseQuery, WorkspaceEntry,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -20,11 +20,59 @@ pub fn conversation_ops_routes(state: ConversationRouterState) -> Router {
         .route("/api/conversations/{id}/slash-commands", get(get_slash_commands))
         .route("/api/conversations/{id}/usage", get(get_usage))
         .route(
+            "/api/conversations/{id}/native-goal",
+            get(get_native_goal).put(set_native_goal).delete(clear_native_goal),
+        )
+        .route(
             "/api/conversations/{id}/config-options/{option_id}",
             put(set_config_option),
         )
         .route("/api/conversations/{id}/workspace", get(browse_workspace))
         .with_state(state)
+}
+
+async fn get_native_goal(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<NativeGoalStateResponse>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .get_native_goal(&user.id, &id)
+            .await
+            .map_err(ApiError::from)?,
+    )))
+}
+
+async fn set_native_goal(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    body: Result<Json<SetNativeGoalRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<NativeGoalStateResponse>>, ApiError> {
+    let Json(request) = body.map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .set_native_goal(&user.id, &id, request)
+            .await
+            .map_err(ApiError::from)?,
+    )))
+}
+
+async fn clear_native_goal(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<NativeGoalStateResponse>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .clear_native_goal(&user.id, &id)
+            .await
+            .map_err(ApiError::from)?,
+    )))
 }
 
 // ── Route handlers ─────────────────────────────────────────────────
@@ -75,6 +123,14 @@ async fn get_slash_commands(
     Extension(user): Extension<CurrentUser>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<Vec<SlashCommandItem>>>, ApiError> {
+    if state
+        .steward
+        .is_steward_conversation(&user.id, &id)
+        .await
+        .map_err(ApiError::from)?
+    {
+        return Ok(Json(ApiResponse::ok(StewardService::fixed_slash_commands())));
+    }
     Ok(Json(ApiResponse::ok(
         state
             .service

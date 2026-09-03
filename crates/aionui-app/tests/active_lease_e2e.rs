@@ -68,6 +68,7 @@ fn team_agent(slot_id: &str, name: &str, role: TeammateRole, conversation_id: &s
         backend: "acp".to_owned(),
         model: "claude".to_owned(),
         assistant_id: None,
+        worker_profile: None,
         status: None,
         conversation_type: None,
         cli_path: None,

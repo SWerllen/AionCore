@@ -35,6 +35,7 @@ async fn fixture_params(
         .expect("seeded backend row must exist");
 
     let config = AcpBuildExtra {
+        steward: false,
         agent_id: None,
         backend: Some(backend.to_owned()),
         cli_path: None,
@@ -46,6 +47,7 @@ async fn fixture_params(
         session_mode: None,
         current_model_id: None,
         thought_level: None,
+        context_window: None,
         cron_job_id: None,
         team_mcp_stdio_config: None,
         mcp_server_ids: None,

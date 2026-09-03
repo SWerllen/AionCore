@@ -208,6 +208,48 @@ pub struct AssistantPreferencesResponse {
     pub last_mcp_ids: Vec<String>,
 }
 
+/// A user-priced, explicitly runnable model/reasoning combination for Team
+/// staffing. `estimated_cost_micros` is the user's comparable estimate per
+/// assigned task, not a claim about provider billing.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AssistantWorkerProfileResponse {
+    pub id: String,
+    pub name: String,
+    pub model_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
+    pub difficulty_ceiling: u8,
+    pub estimated_cost_micros: i64,
+    pub currency: String,
+    pub enabled: bool,
+    pub sort_order: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AssistantWorkerProfileRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub name: String,
+    pub model_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
+    pub difficulty_ceiling: u8,
+    pub estimated_cost_micros: i64,
+    pub currency: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub sort_order: i32,
+}
+
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AssistantDetailResponse {
     pub id: String,
@@ -227,6 +269,8 @@ pub struct AssistantDetailResponse {
     pub defaults: AssistantDefaultsResponse,
     pub capabilities: AssistantCapabilitiesResponse,
     pub preferences: AssistantPreferencesResponse,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub worker_profiles: Vec<AssistantWorkerProfileResponse>,
 }
 
 pub fn assistant_avatar_response_value(
@@ -323,6 +367,8 @@ pub struct CreateAssistantRequest {
     pub recommended_prompts_i18n: Option<HashMap<String, Vec<String>>>,
     #[serde(default)]
     pub defaults: Option<AssistantDefaultsRequest>,
+    #[serde(default)]
+    pub worker_profiles: Option<Vec<AssistantWorkerProfileRequest>>,
 }
 
 /// `PUT /api/assistants/{id}`. All fields optional; partial update semantics.
@@ -358,6 +404,8 @@ pub struct UpdateAssistantRequest {
     pub recommended_prompts_i18n: Option<HashMap<String, Vec<String>>>,
     #[serde(default)]
     pub defaults: Option<AssistantDefaultsRequest>,
+    #[serde(default)]
+    pub worker_profiles: Option<Vec<AssistantWorkerProfileRequest>>,
 }
 
 /// `PATCH /api/assistants/{id}/state`. Upserts `assistant_overrides`.

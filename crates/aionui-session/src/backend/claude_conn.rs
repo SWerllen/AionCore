@@ -3051,6 +3051,10 @@ fn sniff_task(
 
 #[async_trait::async_trait]
 impl SessionBackend for ClaudeSessionBackend {
+    fn provider_name(&self) -> &'static str {
+        "claude"
+    }
+
     /// Force-kill path (`UserCancelTimeout`): delegate to the suspend
     /// controller's unconditional teardown (abort reader → group-kill the
     /// claude CLI process tree), so the process dies even while an orchestrator

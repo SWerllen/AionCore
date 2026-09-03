@@ -5,21 +5,15 @@ pub const TEAM_TOOLS_SCHEMA_VERSION: u32 = 1;
 
 pub const TEAM_SPAWN_AGENT_DESCRIPTION: &str = r#"Create a new teammate agent to join the team.
 
-Use this only when one of the following is true:
-- The user explicitly approved the proposed teammate lineup in a previous message
-- The user explicitly instructed you to create a specific teammate immediately
-
-Before calling this tool in the normal planning flow:
-- Start with one short sentence explaining why additional teammates would help
-- Tell the user which teammate(s) you recommend
-- Present the proposal as a table with: name, responsibility, and recommended assistant
-- Include each teammate's responsibility and recommended assistant
-- Ask whether to create them as proposed or change any names, responsibilities, or assistant choices
-- In that approval question, remind the user that they can later ask you to replace or adjust any teammate if the lineup is not working well
-- Do NOT call this tool in that same turn; wait for explicit approval in a later user message
+Use this when the current conversation leader determines that an internal worker
+materially improves quality, latency, independent verification, specialization,
+or cost. The leader may make that decision at the beginning or midway through a
+task. A separate team-mode or staffing confirmation is not required; normal
+approval rules still apply to any risky external action the worker may perform.
 
 When calling this tool, always provide assistant_id from the available assistants catalog.
-Do not provide a model. The new teammate uses the selected assistant's configured/default model; users can adjust models from the UI model selector.
+Every catalog entry exposes at least one enabled worker_profile. Estimate the task difficulty from 1 to 5 and normally choose the lowest estimated-cost profile whose difficulty_ceiling meets the task. Reliability, latency, or explicit user constraints may justify a stronger profile. Always include worker_profile_id so the selected model and reasoning effort are applied exactly.
+Do not provide a raw model; model and reasoning selection come from the chosen worker profile or assistant defaults.
 
 The new agent will be created and added to the team. You can then assign tasks and send messages to it."#;
 
@@ -31,7 +25,7 @@ Use team_list_assistants to find candidate assistant_id values.\n\
 After confirming a match, call team_spawn_agent with the same assistant_id.";
 
 pub const TEAM_LIST_ASSISTANTS_DESCRIPTION: &str = "List the assistants available for team spawning. Returns the real assistant catalog with \
-real assistant_id values, names, backends, descriptions, and skills.\n\nUse this before \
+real assistant_id values, names, backends, descriptions, skills, and user-priced worker profiles.\n\nUse this before \
 team_spawn_agent when you need the exact assistant_id for a teammate. Do NOT guess from backend \
 names like claude/codex/gemini — only use assistant_id values returned here.";
 
@@ -509,13 +503,14 @@ fn tool_specs() -> Vec<TeamToolSpec> {
                 "additionalProperties": false,
                 "properties": {
                     "name": { "type": "string", "description": "Agent display name" },
-                    "assistant_id": { "type": "string", "description": "Assistant ID to spawn. Call team_list_assistants when you need candidates; the runtime backend is derived from this assistant." }
+                    "assistant_id": { "type": "string", "description": "Assistant ID to spawn. Call team_list_assistants when you need candidates; the runtime backend is derived from this assistant." },
+                    "worker_profile_id": { "type": "string", "description": "Required worker profile ID returned under the selected assistant. Applies that profile's model, reasoning effort, difficulty ceiling, and estimated cost exactly." }
                 },
-                "required": ["name", "assistant_id"]
+                "required": ["name", "assistant_id", "worker_profile_id"]
             }),
             cli_command: &["spawn-agent"],
             when: "Spawn teammate",
-            input_summary: "name, assistant_id",
+            input_summary: "name, assistant_id, worker_profile_id",
         },
         TeamToolSpec {
             name: TeamToolName::TeamRenameAgent,

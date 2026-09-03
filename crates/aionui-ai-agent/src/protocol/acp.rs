@@ -409,7 +409,7 @@ impl AcpProtocol {
     /// Returns the raw JSON response value from the agent.
     pub async fn ext_request(&self, req: ExtRequest) -> Result<ExtResponse, AcpError> {
         self.ensure_connected()?;
-        let method = format!("_{}", req.method);
+        let method = req.method.to_string();
         let wrapped = ClientRequest::ExtMethodRequest(req);
         let value = self.send_request(wrapped, &method).await?;
         let raw = serde_json::value::to_raw_value(&value).map_err(|e| AcpError::AgentInternal {
@@ -425,7 +425,7 @@ impl AcpProtocol {
         if !self.is_connected() {
             return;
         }
-        let method = format!("_{}", notification.method);
+        let method = notification.method.to_string();
         log_client_notify(&method, &json_str(&notification));
         let wrapped = ClientNotification::ExtNotification(notification);
         let _ = self.connection.send_notification(wrapped);

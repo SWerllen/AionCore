@@ -70,8 +70,8 @@ pub struct InterruptAgentInput {
 
 /// Arguments for the `team_spawn_agent` MCP tool call.
 ///
-/// Team spawning is assistant-first. The MCP tool accepts an assistant identity;
-/// model selection comes from the assistant configuration or UI model selector.
+/// Team spawning is assistant-first and profile-bound. The MCP tool accepts an
+/// assistant identity plus one enabled worker template from the catalog.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SpawnAgentInput {
@@ -79,6 +79,8 @@ pub struct SpawnAgentInput {
     #[serde(default)]
     #[serde(alias = "assistantId")]
     pub assistant_id: Option<String>,
+    #[serde(alias = "workerProfileId")]
+    pub worker_profile_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -227,6 +229,7 @@ mod tests {
         let result = serde_json::from_value::<SpawnAgentInput>(json!({
             "name": "Helper",
             "assistant_id": "word-creator",
+            "worker_profile_id": "profile-balanced",
             "role": "teammate"
         }));
 
@@ -238,6 +241,7 @@ mod tests {
         let result = serde_json::from_value::<SpawnAgentInput>(json!({
             "name": "Helper",
             "assistant_id": "word-creator",
+            "worker_profile_id": "profile-balanced",
             "model": "claude-sonnet-4"
         }));
 
@@ -254,6 +258,10 @@ mod tests {
         let names: Vec<&str> = required.iter().filter_map(|v| v.as_str()).collect();
         assert!(names.contains(&"name"), "name must be required");
         assert!(names.contains(&"assistant_id"), "assistant_id must be required");
+        assert!(
+            names.contains(&"worker_profile_id"),
+            "worker_profile_id must be required"
+        );
         assert!(
             !names.contains(&"backend"),
             "backend should not appear in the assistant-first schema"
@@ -334,13 +342,14 @@ mod tests {
         let input: SpawnAgentInput = serde_json::from_value(json!({
             "name": "Preset helper",
             "assistant_id": "word-creator",
+            "worker_profile_id": "profile-balanced",
         }))
         .unwrap();
         assert_eq!(input.assistant_id.as_deref(), Some("word-creator"));
     }
 
     #[test]
-    fn team_spawn_agent_schema_requires_assistant_id_only() {
+    fn team_spawn_agent_schema_requires_assistant_and_worker_profile() {
         let desc = all_tool_descriptors()
             .into_iter()
             .find(|d| d.name == "team_spawn_agent")
@@ -348,6 +357,9 @@ mod tests {
         let props = desc.input_schema["properties"].as_object().unwrap();
         let assistant_desc = props["assistant_id"]["description"].as_str().unwrap();
         assert!(assistant_desc.starts_with("Assistant ID to spawn"));
+        assert!(props.contains_key("worker_profile_id"));
+        let required = desc.input_schema["required"].as_array().unwrap();
+        assert!(required.iter().any(|value| value == "worker_profile_id"));
         assert!(!props.contains_key("model"));
         assert!(!props.contains_key("agent_type"));
         assert!(!props.contains_key("backend"));

@@ -348,6 +348,10 @@ async fn handle_callback_query(
     }
 
     let chat_id = cb.message.as_ref().map(|m| m.chat.id).unwrap_or(cb.from.id);
+    let is_group = cb
+        .message
+        .as_ref()
+        .is_some_and(|message| message.chat.chat_type != "private");
 
     let message_id = cb.message.as_ref().map(|m| m.message_id.to_string());
 
@@ -376,6 +380,7 @@ async fn handle_callback_query(
         id: cb.id.clone(),
         platform: PluginType::Telegram,
         chat_id: chat_id.to_string(),
+        is_group,
         user,
         content: UnifiedMessageContent {
             content_type: MessageContentType::Action,
@@ -422,6 +427,7 @@ async fn handle_message(msg: &TgMessage, message_tx: &mpsc::Sender<UnifiedIncomi
         id: msg.message_id.to_string(),
         platform: PluginType::Telegram,
         chat_id: msg.chat.id.to_string(),
+        is_group: msg.chat.chat_type != "private",
         user,
         content: UnifiedMessageContent {
             content_type,

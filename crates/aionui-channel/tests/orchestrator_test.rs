@@ -16,6 +16,7 @@ fn make_text_message(user_id: &str, chat_id: &str, text: &str) -> UnifiedIncomin
         id: "msg-1".into(),
         platform: PluginType::Telegram,
         chat_id: chat_id.into(),
+        is_group: false,
         user: UnifiedUser {
             id: user_id.into(),
             username: None,

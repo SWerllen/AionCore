@@ -16,12 +16,12 @@ use crate::registry::CatalogSender;
 use crate::shared_kernel::{ConfigKey, ConfigValue, ModeId, ModelId, SessionId as DomainSessionId};
 use crate::types::SendMessageData;
 use agent_client_protocol::schema::v1::{
-    AvailableCommand, CancelNotification, SessionConfigOptionCategory, SessionId, SessionNotification,
+    AvailableCommand, CancelNotification, ExtRequest, SessionConfigOptionCategory, SessionId, SessionNotification,
     SetSessionConfigOptionRequest, SetSessionModeRequest, UsageUpdate,
 };
 use aionui_api_types::{
-    AgentHandshake, ConfigOptionConfirmation, GetConfigOptionsResponse, SetConfigOptionResponse,
-    SlashCommandCompletionBehavior, SlashCommandItem,
+    AgentHandshake, ConfigOptionConfirmation, GetConfigOptionsResponse, NativeGoalStateResponse,
+    SetConfigOptionResponse, SetNativeGoalRequest, SlashCommandCompletionBehavior, SlashCommandItem,
 };
 use aionui_common::{
     AgentKillReason, AgentType, ConversationStatus, ErrorChain, TimestampMs, normalize_keys_to_snake_case, now_ms,
@@ -1212,6 +1212,37 @@ impl AcpAgentManager {
             .map(slash_command_items)
             .unwrap_or_default();
         Ok(items)
+    }
+
+    /// Invoke AionUi's provider-native goal extension after opening or resuming
+    /// the real ACP session. Goal state remains owned by the provider harness;
+    /// this method does not cache or synthesize it in AionCore.
+    pub(crate) async fn native_goal_request(
+        &self,
+        method: &'static str,
+        request: Option<&SetNativeGoalRequest>,
+    ) -> Result<NativeGoalStateResponse, AgentError> {
+        let session_id = self.ensure_session_opened().await?;
+        let mut params = serde_json::Map::new();
+        params.insert("sessionId".into(), Value::String(session_id));
+        if let Some(request) = request {
+            if let Some(objective) = request.objective.as_deref() {
+                params.insert("objective".into(), Value::String(objective.trim().to_owned()));
+            }
+            if let Some(status) = request.status {
+                params.insert("status".into(), Value::String(status.provider_value().to_owned()));
+            }
+            if request.clear_token_budget {
+                params.insert("tokenBudget".into(), Value::Null);
+            } else if let Some(token_budget) = request.token_budget {
+                params.insert("tokenBudget".into(), Value::Number(token_budget.into()));
+            }
+        }
+        let raw = serde_json::value::to_raw_value(&Value::Object(params))
+            .map_err(|e| AgentError::internal(format!("Failed to serialize native goal request: {e}")))?;
+        let response = self.protocol.ext_request(ExtRequest::new(method, raw.into())).await?;
+        serde_json::from_str(response.0.get())
+            .map_err(|e| AgentError::bad_gateway(format!("Agent returned an invalid native goal response: {e}")))
     }
 }
 

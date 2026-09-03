@@ -33,6 +33,7 @@ mod sidebar;
 mod skill;
 mod skill_delivery;
 mod skill_runtime;
+mod steward;
 mod system;
 mod team;
 mod team_mcp;
@@ -42,9 +43,10 @@ mod websocket;
 pub use acp::{
     AcpConfigOptionDto, AcpConfigSelectOptionDto, AcpEnvResponse, AgentModeResponse, ConfigOptionConfirmation,
     DetectCliRequest, DetectCliResponse, GetConfigOptionsResponse, GetModelInfoResponse, ModelInfoEntry,
-    ModelInfoPayload, ProbeModelRequest, SetConfigOptionRequest, SetConfigOptionResponse, SetModeRequest,
-    SetModelRequest, SideQuestionRequest, SideQuestionResponse, TryConnectCustomAgentRequest,
-    TryConnectCustomAgentResponse, WorkspaceBrowseQuery, WorkspaceEntry,
+    ModelInfoPayload, NativeGoalBudgetKind, NativeGoalCapabilities, NativeGoalControlMode, NativeGoalSnapshot,
+    NativeGoalStateResponse, NativeGoalStatus, ProbeModelRequest, SetConfigOptionRequest, SetConfigOptionResponse,
+    SetModeRequest, SetModelRequest, SetNativeGoalRequest, SideQuestionRequest, SideQuestionResponse,
+    TryConnectCustomAgentRequest, TryConnectCustomAgentResponse, WorkspaceBrowseQuery, WorkspaceEntry,
 };
 pub use acp_prompt_hook::AcpPromptHookWarningPayload;
 pub use agent_build_extra::{
@@ -53,7 +55,8 @@ pub use agent_build_extra::{
 };
 pub use agent_discovery::{
     AgentEnvEntry, AgentHandshake, AgentLogoEntry, AgentManagementRow, AgentManagementStatus, AgentMetadata,
-    AgentSnapshotCheckKind, AgentSnapshotCheckStatus, AgentSource, AgentSourceInfo, BehaviorPolicy,
+    AgentSnapshotCheckKind, AgentSnapshotCheckStatus, AgentSource, AgentSourceInfo, BehaviorPolicy, HarnessPolicy,
+    McpPolicy, SkillPolicy,
 };
 pub use agent_error::{
     AgentErrorCode, AgentErrorOwnership, AgentErrorResolution, AgentErrorResolutionKind, AgentErrorResolutionTarget,
@@ -70,9 +73,9 @@ pub use assistant::{
     AssistantDefaultScalarResponse, AssistantDefaultsRequest, AssistantDefaultsResponse, AssistantDetailResponse,
     AssistantEngineResponse, AssistantMcpBindingChanged, AssistantPreferencesResponse, AssistantProfileResponse,
     AssistantPromptsResponse, AssistantResponse, AssistantRulesResponse, AssistantSource, AssistantStateResponse,
-    CreateAssistantRequest, ImportAssistantsRequest, ImportAssistantsResult, ImportError, SetAssistantStateRequest,
-    UpdateAssistantRequest, assistant_avatar_response_value, assistant_avatar_response_value_with_version,
-    is_local_avatar_value,
+    AssistantWorkerProfileRequest, AssistantWorkerProfileResponse, CreateAssistantRequest, ImportAssistantsRequest,
+    ImportAssistantsResult, ImportError, SetAssistantStateRequest, UpdateAssistantRequest,
+    assistant_avatar_response_value, assistant_avatar_response_value_with_version, is_local_avatar_value,
 };
 pub use auth::{
     AuthStatusResponse, ChangePasswordRequest, EnsureExternalSessionRequest, EnsureExternalSessionResponse,
@@ -83,10 +86,11 @@ pub use auth::{
 };
 pub use channel::{
     ApprovePairingRequest, BridgeResponse, ChannelAssistantSettingRequest, ChannelAssistantSettingResponse,
-    ChannelDefaultModelSetting, ChannelPlatformSettingsResponse, ChannelSessionResponse, ChannelUserResponse,
-    DisablePluginRequest, EnablePluginRequest, PairingRequestResponse, PairingRequestedPayload,
-    PluginStatusChangedPayload, PluginStatusResponse, RejectPairingRequest, RevokeUserRequest,
-    SyncChannelSettingsRequest, TestPluginExtraConfig, TestPluginRequest, TestPluginResponse, UserAuthorizedPayload,
+    ChannelConversationTarget, ChannelConversationTargetRequest, ChannelDefaultModelSetting,
+    ChannelPlatformSettingsResponse, ChannelSessionResponse, ChannelUserResponse, DisablePluginRequest,
+    EnablePluginRequest, PairingRequestResponse, PairingRequestedPayload, PluginStatusChangedPayload,
+    PluginStatusResponse, RejectPairingRequest, RevokeUserRequest, SyncChannelSettingsRequest, TestPluginExtraConfig,
+    TestPluginRequest, TestPluginResponse, UserAuthorizedPayload,
 };
 pub use chat_file::ChatFileRef;
 pub use confirmation::{ApprovalCheckQuery, ApprovalCheckResponse, ConfirmRequest, ConfirmationListResponse};
@@ -187,6 +191,15 @@ pub use skill_runtime::{
     RuntimeSkillFileQuery, RuntimeSkillFileResponse, RuntimeSkillListItem, RuntimeSkillListResponse,
     RuntimeSkillShowResponse, SKILL_RUNTIME_SCHEMA_VERSION, SkillRuntimeEnvelope, SkillRuntimeErrorCode,
     SkillRuntimeErrorPayload, SkillRuntimeMeta,
+};
+pub use steward::{
+    AskStewardTaskRequest, BindStewardTaskSessionRequest, BootstrapStewardRequest, CreateStewardTaskRequest,
+    DEFAULT_STEWARD_ASSISTANT_ID, DispatchStewardTaskRequest, ExecuteStewardCommandRequest, ListStewardTasksQuery,
+    ResolveStewardTaskRequest, ResumeStewardTaskRequest, STEWARD_MCP_SERVER_NAME, StewardCommandResponse,
+    StewardExecutionState, StewardOverviewResponse, StewardProfileResponse, StewardSessionRole,
+    StewardTaskCandidateResponse, StewardTaskEventResponse, StewardTaskInquiryResponse, StewardTaskLifecycle,
+    StewardTaskResponse, StewardTaskSessionResponse, StewardUnregisteredConversationResponse,
+    SwitchStewardAssistantRequest, UpdateStewardTaskRequest,
 };
 pub use system::{
     ClientPreferencesResponse, CurrentUserResponse, FeedbackDiagnosticsContextResponse,

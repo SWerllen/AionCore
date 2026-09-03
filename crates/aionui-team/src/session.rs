@@ -92,6 +92,7 @@ pub(crate) enum PrepareBatchResult {
 pub struct SpawnAgentRequest {
     pub name: String,
     pub assistant_id: Option<String>,
+    pub worker_profile_id: Option<String>,
 }
 
 pub struct TeamSession {
@@ -1883,15 +1884,22 @@ impl TeamSession {
         // Step 3: resolve the effective assistant/backend/model target before
         // capability checks. Assistant spawns derive backend from the preset
         // identity rather than inheriting the caller backend.
-        let (backend, model) = service
-            .resolve_spawn_backend_and_model(
-                &self.user_id,
-                Some(assistant_id),
-                None,
-                caller.backend.as_str(),
-                caller.model.as_str(),
-            )
+        let (backend, model, worker_profile) = service
+            .resolve_spawn_target(&self.user_id, assistant_id, req.worker_profile_id.as_deref())
             .await?;
+        if let Some(profile) = worker_profile.as_ref() {
+            info!(
+                team_id = %self.team.id,
+                assistant_id = %assistant_id,
+                worker_profile_id = %profile.worker_profile_id,
+                model_id = %profile.model_id,
+                reasoning_effort = profile.reasoning_effort.as_deref().unwrap_or("default"),
+                difficulty_ceiling = profile.difficulty_ceiling,
+                estimated_cost_micros = profile.estimated_cost_micros,
+                currency = %profile.currency,
+                "Leader selected priced worker profile"
+            );
+        }
 
         // Step 4: DB side-effects (new conversation + persisted agent slot).
         // Assistant-first spawn has already passed the team-selectable catalog
@@ -1906,6 +1914,7 @@ impl TeamSession {
                 backend,
                 model,
                 assistant_id: Some(assistant_id.to_owned()),
+                worker_profile,
             })
             .await?;
 
@@ -2736,6 +2745,7 @@ mod tests {
                     backend: "acp".into(),
                     model: "claude".into(),
                     assistant_id: None,
+                    worker_profile: None,
                     status: None,
                     conversation_type: None,
                     cli_path: None,
@@ -2748,6 +2758,7 @@ mod tests {
                     backend: "acp".into(),
                     model: "claude".into(),
                     assistant_id: None,
+                    worker_profile: None,
                     status: None,
                     conversation_type: None,
                     cli_path: None,
@@ -2958,6 +2969,7 @@ mod tests {
             backend: "acp".into(),
             model: "claude".into(),
             assistant_id: None,
+            worker_profile: None,
             status: None,
             conversation_type: None,
             cli_path: None,
@@ -3078,6 +3090,7 @@ mod tests {
         SpawnAgentRequest {
             name: "Helper".into(),
             assistant_id: Some("word-creator".into()),
+            worker_profile_id: None,
         }
     }
 
@@ -4338,6 +4351,7 @@ mod tests {
         SpawnAgentRequest {
             name: "Helper".into(),
             assistant_id: assistant_id.map(str::to_owned),
+            worker_profile_id: None,
         }
     }
 

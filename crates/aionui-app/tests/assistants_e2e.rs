@@ -642,6 +642,85 @@ async fn create_happy_path_returns_201() {
 }
 
 #[tokio::test]
+async fn worker_profiles_roundtrip_through_assistant_http_contract() {
+    let fx = fixture().await;
+    let create = json_with_token(
+        "POST",
+        "/api/assistants",
+        json!({
+            "id": "priced-codex",
+            "name": "Priced Codex",
+            "agent_id": "8e1acf31",
+            "worker_profiles": [{
+                "name": "Economy",
+                "model_id": "gpt-5-mini",
+                "reasoning_effort": "medium",
+                "difficulty_ceiling": 3,
+                "estimated_cost_micros": 1250000,
+                "currency": "CNY",
+                "enabled": true,
+                "sort_order": 0
+            }]
+        }),
+        &fx.token,
+        &fx.csrf,
+    );
+    let response = fx.app.clone().oneshot(create).await.unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let detail = fx
+        .app
+        .clone()
+        .oneshot(get_with_token("/api/assistants/priced-codex", &fx.token))
+        .await
+        .unwrap();
+    assert_eq!(detail.status(), StatusCode::OK);
+    let detail_json = body_json(detail).await;
+    let profile = &detail_json["data"]["worker_profiles"][0];
+    let profile_id = profile["id"].as_str().expect("server-generated profile id").to_owned();
+    assert_eq!(profile["name"], "Economy");
+    assert_eq!(profile["model_id"], "gpt-5-mini");
+    assert_eq!(profile["reasoning_effort"], "medium");
+    assert_eq!(profile["difficulty_ceiling"], 3);
+    assert_eq!(profile["estimated_cost_micros"], 1_250_000);
+
+    let update = json_with_token(
+        "PUT",
+        "/api/assistants/priced-codex",
+        json!({
+            "worker_profiles": [{
+                "id": profile_id,
+                "name": "Economy Plus",
+                "model_id": "gpt-5-mini",
+                "reasoning_effort": "high",
+                "difficulty_ceiling": 4,
+                "estimated_cost_micros": 1750000,
+                "currency": "CNY",
+                "enabled": true,
+                "sort_order": 0
+            }]
+        }),
+        &fx.token,
+        &fx.csrf,
+    );
+    let response = fx.app.clone().oneshot(update).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let detail = fx
+        .app
+        .oneshot(get_with_token("/api/assistants/priced-codex", &fx.token))
+        .await
+        .unwrap();
+    let detail_json = body_json(detail).await;
+    let updated = &detail_json["data"]["worker_profiles"][0];
+    assert_eq!(updated["id"], profile_id);
+    assert_eq!(updated["name"], "Economy Plus");
+    assert_eq!(updated["reasoning_effort"], "high");
+    assert_eq!(updated["difficulty_ceiling"], 4);
+    assert_eq!(updated["estimated_cost_micros"], 1_750_000);
+}
+
+#[tokio::test]
 async fn create_rejects_empty_name_with_400() {
     let fx = fixture().await;
     let req = json_with_token("POST", "/api/assistants", json!({ "name": "   " }), &fx.token, &fx.csrf);

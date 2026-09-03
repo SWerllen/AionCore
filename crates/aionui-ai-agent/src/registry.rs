@@ -31,7 +31,7 @@ use tracing::{debug, info, warn};
 
 use crate::error::AgentError;
 use crate::manager::acp::config_option_catalog::{
-    enrich_handshake_with_config_option_catalog, merge_config_option_values,
+    enrich_handshake_with_config_option_catalog, merge_config_option_values, preserve_model_capability_extensions,
 };
 
 /// Capacity of the catalog-sync MPSC channel. A single writer thread
@@ -179,6 +179,20 @@ impl AgentRegistry {
                 snapshot.config_options = Some(merged_config_options);
             }
         }
+        if snapshot.config_options.is_some() || snapshot.available_models.is_some() {
+            // Both session-model and ACP catalog forwarders can publish a
+            // fresh `{id,label}` model list. Some ACP notifications contain no
+            // config_options at all, so guard every model-catalog write.
+            // Otherwise opening a Qoder session immediately erases its probed
+            // reasoning/context matrices.
+            if let Some(existing_models) = self.existing_available_models_for_user(user_id, id).await? {
+                if let Some(incoming_models) = snapshot.available_models.as_mut() {
+                    preserve_model_capability_extensions(&existing_models, incoming_models);
+                } else {
+                    snapshot.available_models = Some(existing_models);
+                }
+            }
+        }
 
         let snapshot = enrich_handshake_with_config_option_catalog(&snapshot);
         let agent_capabilities = encode_optional(&snapshot.agent_capabilities, "agent_capabilities")?;
@@ -240,6 +254,18 @@ impl AgentRegistry {
         Ok(row
             .and_then(|row| decode_row(row, AvailabilityProjection::Cached))
             .and_then(|(meta, _)| meta.handshake.config_options))
+    }
+
+    async fn existing_available_models_for_user(&self, user_id: &str, id: &str) -> Result<Option<Value>, AgentError> {
+        let row = if user_id == SYSTEM_DEFAULT_USER_ID {
+            self.repo.get(id).await
+        } else {
+            self.repo.get_for_user(user_id, id).await
+        }
+        .map_err(|e| AgentError::internal(format!("load agent_metadata '{id}' for model catalog merge: {e}")))?;
+        Ok(row
+            .and_then(|row| decode_row(row, AvailabilityProjection::Cached))
+            .and_then(|(meta, _)| meta.handshake.available_models))
     }
 
     async fn update_cached_unavailable_reason(&self, id: &str, reason: Option<UnavailableReason>) {
@@ -1845,6 +1871,91 @@ mod tests {
         let refreshed = reg.get(&claude.id).await.unwrap();
         let methods = refreshed.handshake.auth_methods.unwrap();
         assert_eq!(methods.as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn runtime_catalog_writeback_preserves_probed_qoder_context_windows() {
+        let reg = registry().await;
+        let qoder = reg.find_builtin_by_backend("qoder").await.unwrap();
+
+        reg.apply_handshake_inner(
+            SYSTEM_DEFAULT_USER_ID,
+            &qoder.id,
+            &AgentHandshake {
+                available_models: Some(serde_json::json!({
+                    "current_model_id": "ultimate",
+                    "available_models": [{
+                        "id": "ultimate",
+                        "label": "Ultimate",
+                        "reasoning_efforts": ["high", "max"],
+                        "available_context_windows": [200000, 400000, 1000000],
+                        "default_context_window": 200000
+                    }]
+                })),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        // Matches the normal session-open writeback: a fresh model select and
+        // `{id,label}` model list, with probe-only extensions absent.
+        reg.apply_handshake_inner(
+            SYSTEM_DEFAULT_USER_ID,
+            &qoder.id,
+            &AgentHandshake {
+                config_options: Some(serde_json::json!({
+                    "config_options": [{
+                        "id": "model",
+                        "category": "model",
+                        "type": "select",
+                        "currentValue": "ultimate",
+                        "options": [{"value": "ultimate", "name": "Ultimate"}]
+                    }]
+                })),
+                available_models: Some(serde_json::json!({
+                    "current_model_id": "ultimate",
+                    "available_models": [{"id": "ultimate", "label": "Ultimate"}]
+                })),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let refreshed = reg.get(&qoder.id).await.unwrap();
+        let model = &refreshed.handshake.available_models.unwrap()["available_models"][0];
+        assert_eq!(
+            model["available_context_windows"],
+            serde_json::json!([200_000, 400_000, 1_000_000])
+        );
+        assert_eq!(model["default_context_window"], serde_json::json!(200_000));
+        assert_eq!(model["reasoning_efforts"], serde_json::json!(["high", "max"]));
+
+        // ACP CatalogUpdated notifications may carry only the top-level model
+        // catalog. That write path must preserve the same probe-only fields.
+        reg.apply_handshake_inner(
+            SYSTEM_DEFAULT_USER_ID,
+            &qoder.id,
+            &AgentHandshake {
+                available_models: Some(serde_json::json!({
+                    "current_model_id": "ultimate",
+                    "available_models": [{"id": "ultimate", "label": "Ultimate"}]
+                })),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let refreshed = reg.get(&qoder.id).await.unwrap();
+        let model = &refreshed.handshake.available_models.unwrap()["available_models"][0];
+        assert_eq!(
+            model["available_context_windows"],
+            serde_json::json!([200_000, 400_000, 1_000_000])
+        );
+        assert_eq!(model["default_context_window"], serde_json::json!(200_000));
+        assert_eq!(model["reasoning_efforts"], serde_json::json!(["high", "max"]));
     }
 
     #[tokio::test]

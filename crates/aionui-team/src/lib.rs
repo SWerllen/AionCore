@@ -45,14 +45,14 @@ pub use ports::{
     AgentTurnSource, AgentTurnStarted, AgentTurnStartedCallback, AgentTurnStatus, NativeSlashCommandPort,
     NoopNativeSlashCommandPort, SlashCatalogSource, SlashCommandRecognition, TeamAssistantCatalogEntry,
     TeamAssistantCatalogPort, TeamConversationBindingLookup, TeamConversationLookupPort, TeamToolCapabilityPort,
-    UnknownTeamToolCapabilityPort,
+    TeamWorkerProfile, UnknownTeamToolCapabilityPort,
 };
 
 pub use prompt_dump::TeamPromptDumpConfig;
 pub use prompts::{build_lead_prompt, build_teammate_prompt, build_wake_payload};
 pub use provisioning::{
-    TeamAgentProvisioner, TeamConversationCreateRequest, TeamConversationCreateResult, TeamConversationModelFacts,
-    TeamConversationProvisioningPort, TeamMcpSnapshotResolution,
+    ExistingConversationLeader, TeamAgentProvisioner, TeamConversationCreateRequest, TeamConversationCreateResult,
+    TeamConversationModelFacts, TeamConversationProvisioningPort, TeamMcpSnapshotResolution,
 };
 pub use routes::{TeamRouterState, team_routes};
 pub use runtime_tools::ResolvedTeamToolContext;

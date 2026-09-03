@@ -29,6 +29,7 @@ const LISTENING_EVENT_PREFIX: &str = "AIONCORE_LISTENING";
 const READY_EVENT_MARKER: &str = "AIONCORE_READY";
 const DYNAMIC_BACKEND_BIND_MAX_ATTEMPTS: usize = 50;
 const WORKER_TASK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const SHUTDOWN_RUNTIME_SETTLE_TIMEOUT: Duration = Duration::from_secs(5);
 
 // Bounded graceful-shutdown tail (AIONUI-16). The data-dir instance flock is
 // only released when this process exits, so every await between the shutdown
@@ -50,7 +51,7 @@ const SHUTDOWN_KEEP_AWAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const SHUTDOWN_IDLE_SCANNER_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 const SHUTDOWN_DB_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
-const SHUTDOWN_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(30);
+const SHUTDOWN_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(35);
 
 // The watchdog must outlast the sum of every bounded stage, otherwise it can
 // force-exit a shutdown that is still making progress within its per-stage
@@ -59,6 +60,7 @@ const SHUTDOWN_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(30);
 const _: () = assert!(
     SHUTDOWN_WATCHDOG_TIMEOUT.as_secs()
         > WORKER_TASK_SHUTDOWN_TIMEOUT.as_secs()
+            + SHUTDOWN_RUNTIME_SETTLE_TIMEOUT.as_secs()
             + SHUTDOWN_KEEP_AWAKE_TIMEOUT.as_secs()
             + SHUTDOWN_DRAIN_TIMEOUT.as_secs()
             + SHUTDOWN_IDLE_SCANNER_JOIN_TIMEOUT.as_secs()
@@ -339,6 +341,7 @@ pub(crate) async fn run_server(
         Some(idle_cleanup_coordinator),
     );
     let conversation_runtime_state = services.conversation_runtime_state.clone();
+    let conversation_service = services.conversation_service.clone();
     let worker_task_manager = services.worker_task_manager.clone();
     let client_pref_service = router_runtime.client_pref_service.clone();
 
@@ -408,6 +411,23 @@ pub(crate) async fn run_server(
                             timeout_secs = WORKER_TASK_SHUTDOWN_TIMEOUT.as_secs(),
                             active_task_count,
                             "worker task manager shutdown timed out"
+                        ),
+                    }
+                    match tokio::time::timeout(
+                        SHUTDOWN_RUNTIME_SETTLE_TIMEOUT,
+                        conversation_service.settle_stale_runtime_state_on_shutdown(),
+                    )
+                    .await
+                    {
+                        Ok(()) => info!(
+                            stage = "shutdown.runtime_settle",
+                            "runtime message settlement completed"
+                        ),
+                        Err(_) => warn!(
+                            code = "BOOTSTRAP_SHUTDOWN_STAGE_TIMEOUT",
+                            stage = "shutdown.runtime_settle",
+                            timeout_secs = SHUTDOWN_RUNTIME_SETTLE_TIMEOUT.as_secs(),
+                            "runtime message settlement timed out"
                         ),
                     }
                 }

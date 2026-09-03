@@ -216,7 +216,13 @@ impl TeamSessionBinding {
     }
 
     pub fn from_extra_value(extra: &serde_json::Value) -> Result<Option<Self>, serde_json::Error> {
-        let Some(team_id) = extra_string_field(extra, "teamId") else {
+        // `teamId` marks an old Team-owned member conversation. An ordinary
+        // conversation uses `embedded_team_id`: it stays independently visible
+        // in history while still receiving the same runtime Team/MCP context.
+        let Some(team_id) = extra_string_field(extra, "teamId")
+            .or_else(|| extra_string_field(extra, "embedded_team_id"))
+            .or_else(|| extra_string_field(extra, "embeddedTeamId"))
+        else {
             return Ok(None);
         };
 
@@ -573,6 +579,16 @@ pub struct TeamAgentResponse {
         alias = "customAgentId"
     )]
     pub assistant_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_profile_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_profile_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_cost_micros: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_currency: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
     #[serde(default)]
@@ -1221,6 +1237,11 @@ mod tests {
             icon: Some("/api/assets/logos/ai-major/claude.svg".into()),
             model: "claude".into(),
             assistant_id: Some("assistant-x".into()),
+            worker_profile_id: Some("worker-profile-1".into()),
+            worker_profile_name: Some("Balanced".into()),
+            reasoning_effort: Some("high".into()),
+            estimated_cost_micros: Some(12_500_000),
+            cost_currency: Some("CNY".into()),
             status: Some("idle".into()),
             pending_confirmations: 2,
             context_reset: TeamContextResetCapability {
@@ -1239,6 +1260,9 @@ mod tests {
         assert_eq!(json["icon"], "/api/assets/logos/ai-major/claude.svg");
         assert_eq!(json["model"], "claude");
         assert_eq!(json["assistant_id"], "assistant-x");
+        assert_eq!(json["worker_profile_id"], "worker-profile-1");
+        assert_eq!(json["reasoning_effort"], "high");
+        assert_eq!(json["estimated_cost_micros"], 12_500_000);
         assert!(json.get("custom_agent_id").is_none());
         assert_eq!(json["status"], "idle");
         assert_eq!(json["pending_confirmations"], 2);
@@ -1257,6 +1281,11 @@ mod tests {
             icon: None,
             model: "claude".into(),
             assistant_id: None,
+            worker_profile_id: None,
+            worker_profile_name: None,
+            reasoning_effort: None,
+            estimated_cost_micros: None,
+            cost_currency: None,
             status: None,
             pending_confirmations: 0,
             context_reset: TeamContextResetCapability {
@@ -1287,6 +1316,11 @@ mod tests {
                 icon: Some("/api/assets/logos/ai-major/claude.svg".into()),
                 model: "claude".into(),
                 assistant_id: Some("assistant-x".into()),
+                worker_profile_id: None,
+                worker_profile_name: None,
+                reasoning_effort: None,
+                estimated_cost_micros: None,
+                cost_currency: None,
                 status: None,
                 pending_confirmations: 0,
                 context_reset: TeamContextResetCapability {
@@ -1355,6 +1389,11 @@ mod tests {
                 icon: Some("/api/assets/logos/ai-major/claude.svg".into()),
                 model: "opus".into(),
                 assistant_id: None,
+                worker_profile_id: None,
+                worker_profile_name: None,
+                reasoning_effort: None,
+                estimated_cost_micros: None,
+                cost_currency: None,
                 status: Some("idle".into()),
                 pending_confirmations: 0,
                 context_reset: TeamContextResetCapability {
@@ -1410,6 +1449,11 @@ mod tests {
             icon: Some("/api/assets/logos/ai-major/claude.svg".into()),
             model: "claude".into(),
             assistant_id: Some("custom-1".into()),
+            worker_profile_id: None,
+            worker_profile_name: None,
+            reasoning_effort: None,
+            estimated_cost_micros: None,
+            cost_currency: None,
             status: Some("working".into()),
             pending_confirmations: 1,
             context_reset: TeamContextResetCapability {
@@ -1440,6 +1484,11 @@ mod tests {
                     icon: None,
                     model: "claude".into(),
                     assistant_id: None,
+                    worker_profile_id: None,
+                    worker_profile_name: None,
+                    reasoning_effort: None,
+                    estimated_cost_micros: None,
+                    cost_currency: None,
                     status: None,
                     pending_confirmations: 0,
                     context_reset: TeamContextResetCapability {
@@ -1458,6 +1507,11 @@ mod tests {
                     icon: Some("/api/assets/logos/tools/coding/codex.svg".into()),
                     model: "claude".into(),
                     assistant_id: Some("x".into()),
+                    worker_profile_id: None,
+                    worker_profile_name: None,
+                    reasoning_effort: None,
+                    estimated_cost_micros: None,
+                    cost_currency: None,
                     status: Some("idle".into()),
                     pending_confirmations: 3,
                     context_reset: TeamContextResetCapability {
@@ -1502,6 +1556,11 @@ mod tests {
                 icon: None,
                 model: "sonnet".into(),
                 assistant_id: None,
+                worker_profile_id: None,
+                worker_profile_name: None,
+                reasoning_effort: None,
+                estimated_cost_micros: None,
+                cost_currency: None,
                 status: None,
                 pending_confirmations: 0,
                 context_reset: TeamContextResetCapability {
@@ -1879,6 +1938,24 @@ mod tests {
         assert_eq!(
             TeamSessionBinding::team_id_marker_from_extra_str(extra).as_deref(),
             Some("team-9")
+        );
+    }
+
+    #[test]
+    fn embedded_team_binding_enables_runtime_context_without_team_owned_marker() {
+        let extra = serde_json::json!({
+            "embedded_team_id": "team-hidden",
+            "slot_id": "leader-slot",
+            "role": "lead"
+        });
+
+        let binding = TeamSessionBinding::from_extra_value(&extra).unwrap().unwrap();
+        assert_eq!(binding.team_id, "team-hidden");
+        assert_eq!(binding.slot_id.as_deref(), Some("leader-slot"));
+        assert_eq!(binding.role.as_deref(), Some("lead"));
+        assert!(
+            TeamSessionBinding::team_id_marker_from_extra_str(&extra.to_string()).is_none(),
+            "embedded Leader must remain an ordinary sidebar conversation"
         );
     }
 

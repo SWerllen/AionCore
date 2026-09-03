@@ -13,6 +13,54 @@
 use crate::event::PermissionKind;
 use crate::state::SessionState;
 
+// ===========================================================================
+// PROVIDER-NATIVE CONTROL PLANE
+// ===========================================================================
+
+/// Provider-owned persistent goal state. This deliberately mirrors only the
+/// stable fields exposed by Codex app-server's `thread/goal/*` RPCs; it is kept
+/// SDK/API-neutral so `aionui-session` does not depend on the HTTP DTO crate.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeGoal {
+    pub thread_id: String,
+    pub objective: String,
+    pub status: NativeGoalStatus,
+    #[serde(default)]
+    pub token_budget: Option<u64>,
+    pub tokens_used: u64,
+    pub time_used_seconds: u64,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// Exact Codex goal lifecycle spelling. The HTTP layer maps the two camel-case
+/// limited states to its public snake_case representation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum NativeGoalStatus {
+    #[serde(rename = "active")]
+    Active,
+    #[serde(rename = "paused")]
+    Paused,
+    #[serde(rename = "blocked")]
+    Blocked,
+    #[serde(rename = "usageLimited")]
+    UsageLimited,
+    #[serde(rename = "budgetLimited")]
+    BudgetLimited,
+    #[serde(rename = "complete")]
+    Complete,
+}
+
+/// Partial provider-owned goal update. `token_budget` is nested so callers can
+/// distinguish omission (`None`) from an explicit clear (`Some(None)`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NativeGoalUpdate {
+    pub objective: Option<String>,
+    pub status: Option<NativeGoalStatus>,
+    pub token_budget: Option<Option<u64>>,
+}
+
 // ==========================================================================
 // DOWNWARD — conversation → session (Commands)
 // ==========================================================================

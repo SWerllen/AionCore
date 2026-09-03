@@ -5,7 +5,7 @@ use aionui_api_types::{
     AssistantConversationRequest, CreateConversationRequest, GetConfigOptionsResponse, McpRuntimeSnapshot,
     SetConfigOptionRequest, SetConfigOptionResponse, TeamMcpSelection,
 };
-use aionui_common::AgentType;
+use aionui_common::{AgentType, ProviderWithModel};
 use aionui_conversation::{
     ConversationAgentTurnRequest, ConversationAgentTurnStarted, ConversationAgentTurnStatus, ConversationError,
     ConversationService,
@@ -14,10 +14,10 @@ use aionui_db::models::{AgentMetadataRow, MessageRow};
 use aionui_db::{IAgentMetadataRepository, IConversationRepository};
 use aionui_team::{
     AgentTurnCancellationPort, AgentTurnExecutionError, AgentTurnExecutionPort, AgentTurnOutcome, AgentTurnRequest,
-    AgentTurnStarted, AgentTurnStatus, NativeSlashCommandPort, SlashCatalogSource, SlashCommandRecognition,
-    TeamConversationBindingLookup, TeamConversationCreateRequest, TeamConversationCreateResult,
-    TeamConversationLookupPort, TeamConversationModelFacts, TeamConversationProvisioningPort, TeamError,
-    TeamMcpSnapshotResolution, TeamProjectionMessageStore,
+    AgentTurnStarted, AgentTurnStatus, ExistingConversationLeader, NativeSlashCommandPort, SlashCatalogSource,
+    SlashCommandRecognition, TeamConversationBindingLookup, TeamConversationCreateRequest,
+    TeamConversationCreateResult, TeamConversationLookupPort, TeamConversationModelFacts,
+    TeamConversationProvisioningPort, TeamError, TeamMcpSnapshotResolution, TeamProjectionMessageStore,
 };
 use async_trait::async_trait;
 use tracing::{debug, info, warn};
@@ -451,7 +451,7 @@ impl TeamConversationProvisioningPort for TeamConversationAdapters {
                     assistant: request.assistant_id.map(|assistant_id| AssistantConversationRequest {
                         id: assistant_id,
                         locale: None,
-                        conversation_overrides: None,
+                        conversation_overrides: request.assistant_overrides,
                     }),
                     source: None,
                     channel_chat_id: None,
@@ -516,6 +516,69 @@ impl TeamConversationProvisioningPort for TeamConversationAdapters {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_owned))
+    }
+
+    async fn existing_conversation_leader(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<ExistingConversationLeader, TeamError> {
+        let row = self
+            .conversation_repo
+            .get(user_id, conversation_id)
+            .await?
+            .ok_or_else(|| TeamError::InvalidRequest(format!("conversation {conversation_id} not found")))?;
+        let extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap_or(serde_json::Value::Null);
+        if extra
+            .get("teamId")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty())
+        {
+            return Err(TeamError::InvalidRequest(
+                "a Team-owned conversation cannot become an embedded leader".to_owned(),
+            ));
+        }
+        let workspace = extra
+            .get("workspace")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| TeamError::InvalidRequest("leader conversation has no workspace".to_owned()))?
+            .to_owned();
+        let backend = extra
+            .get("backend")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(row.r#type.as_str())
+            .to_owned();
+        let model = extra
+            .get("current_model_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .or_else(|| {
+                row.model
+                    .as_deref()
+                    .and_then(|raw| serde_json::from_str::<ProviderWithModel>(raw).ok())
+                    .map(|provider| provider.model)
+            })
+            .unwrap_or_default();
+        let assistant_id = self.conversation_assistant_id(conversation_id).await?;
+
+        Ok(ExistingConversationLeader {
+            conversation_id: row.id,
+            name: if row.name.trim().is_empty() {
+                "Conversation Leader".to_owned()
+            } else {
+                row.name
+            },
+            workspace,
+            backend,
+            model,
+            assistant_id,
+        })
     }
 
     async fn create_team_temp_workspace(&self, user_id: &str, team_id: &str) -> Result<String, TeamError> {
@@ -701,6 +764,8 @@ impl TeamConversationProvisioningPort for TeamConversationAdapters {
             user_id: row.user_id,
             team_id: extra
                 .get("teamId")
+                .or_else(|| extra.get("embedded_team_id"))
+                .or_else(|| extra.get("embeddedTeamId"))
                 .and_then(serde_json::Value::as_str)
                 .filter(|s| !s.is_empty())
                 .map(str::to_owned),

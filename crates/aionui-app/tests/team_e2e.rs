@@ -75,7 +75,16 @@ async fn ensure_default_team_assistant(
         json!({
             "id": DEFAULT_TEAM_ASSISTANT_ID,
             "name": "Team E2E Assistant",
-            "agent_id": DEFAULT_TEAM_AGENT_ID
+            "agent_id": DEFAULT_TEAM_AGENT_ID,
+            "worker_profiles": [{
+                "name": "Default E2E Worker",
+                "model_id": "claude",
+                "difficulty_ceiling": 3,
+                "estimated_cost_micros": 0,
+                "currency": "CNY",
+                "enabled": true,
+                "sort_order": 0
+            }]
         }),
         token,
         csrf,
@@ -1156,7 +1165,7 @@ async fn es1_ensure_session() {
 
 // ES-1b: ensure session + team MCP list_assistants projection
 #[tokio::test]
-async fn es1b_team_mcp_list_assistants_matches_assistant_projection() {
+async fn es1b_team_mcp_list_assistants_only_exposes_profile_enabled_assistants() {
     let (mut app, services) = build_app_with_mock_agents().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
     mark_claude_backend_team_mcp_stdio_capable(&services).await;
@@ -1167,6 +1176,41 @@ async fn es1b_team_mcp_list_assistants_matches_assistant_projection() {
     let lead_conversation_id = lead["conversation_id"].as_str().unwrap();
     let lead_slot_id = lead["slot_id"].as_str().unwrap();
 
+    let profile_update = json_with_token(
+        "PUT",
+        &format!("/api/assistants/{DEFAULT_TEAM_ASSISTANT_ID}"),
+        json!({
+            "worker_profiles": [{
+                "name": "Priced E2E Worker",
+                "model_id": "claude-sonnet-e2e",
+                "reasoning_effort": "high",
+                "difficulty_ceiling": 4,
+                "estimated_cost_micros": 2_500_000,
+                "currency": "CNY",
+                "enabled": true,
+                "sort_order": 0
+            }]
+        }),
+        &token,
+        &csrf,
+    );
+    let profile_update_resp = app.clone().oneshot(profile_update).await.unwrap();
+    assert_eq!(profile_update_resp.status(), StatusCode::OK);
+    let profile_detail_resp = app
+        .clone()
+        .oneshot(get_with_token(
+            &format!("/api/assistants/{DEFAULT_TEAM_ASSISTANT_ID}"),
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(profile_detail_resp.status(), StatusCode::OK);
+    let profile_detail_body = body_json(profile_detail_resp).await;
+    let expected_profile_id = profile_detail_body["data"]["worker_profiles"][0]["id"]
+        .as_str()
+        .expect("server-generated worker profile id")
+        .to_owned();
+
     let assistants_resp = app
         .clone()
         .oneshot(get_with_token("/api/assistants", &token))
@@ -1174,7 +1218,7 @@ async fn es1b_team_mcp_list_assistants_matches_assistant_projection() {
         .unwrap();
     assert_eq!(assistants_resp.status(), StatusCode::OK);
     let assistants_body = body_json(assistants_resp).await;
-    let mut expected_ids: Vec<String> = assistants_body["data"]
+    let projection_ids: Vec<String> = assistants_body["data"]
         .as_array()
         .unwrap()
         .iter()
@@ -1182,15 +1226,15 @@ async fn es1b_team_mcp_list_assistants_matches_assistant_projection() {
         .filter(|assistant| assistant["agent"].is_object())
         .map(|assistant| assistant["id"].as_str().unwrap().to_owned())
         .collect();
-    expected_ids.sort();
     assert!(
-        !expected_ids.is_empty(),
+        !projection_ids.is_empty(),
         "fixture must expose at least one team-selectable assistant via /api/assistants: {assistants_body}"
     );
     assert!(
-        expected_ids.contains(&DEFAULT_TEAM_ASSISTANT_ID.to_owned()),
+        projection_ids.contains(&DEFAULT_TEAM_ASSISTANT_ID.to_owned()),
         "seeded team assistant must be team-selectable in assistant projection: {assistants_body}"
     );
+    let expected_ids = vec![DEFAULT_TEAM_ASSISTANT_ID.to_owned()];
 
     let ensure_req = json_with_token(
         "POST",
@@ -1236,8 +1280,22 @@ async fn es1b_team_mcp_list_assistants_matches_assistant_projection() {
 
     assert_eq!(
         runtime_ids, expected_ids,
-        "Team MCP runtime assistant list must match /api/assistants team_selectable projection"
+        "Team MCP runtime assistant list must exclude assistants without enabled worker profiles"
     );
+    let runtime_assistant = list_body["assistants"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|assistant| assistant["assistant_id"] == DEFAULT_TEAM_ASSISTANT_ID)
+        .expect("seeded assistant in Team MCP catalog");
+    let runtime_profile = &runtime_assistant["worker_profiles"][0];
+    assert_eq!(runtime_profile["worker_profile_id"], expected_profile_id);
+    assert_eq!(runtime_profile["name"], "Priced E2E Worker");
+    assert_eq!(runtime_profile["model_id"], "claude-sonnet-e2e");
+    assert_eq!(runtime_profile["reasoning_effort"], "high");
+    assert_eq!(runtime_profile["difficulty_ceiling"], 4);
+    assert_eq!(runtime_profile["estimated_cost_micros"], 2_500_000);
+    assert_eq!(runtime_profile["currency"], "CNY");
 
     let stop_req = delete_with_token(&format!("/api/teams/{team_id}/session"), &token, &csrf);
     let stop_resp = app.oneshot(stop_req).await.unwrap();

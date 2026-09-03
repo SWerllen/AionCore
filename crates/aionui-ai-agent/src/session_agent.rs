@@ -15,8 +15,9 @@ use std::sync::atomic::{AtomicI64, Ordering};
 
 use aionui_common::{AgentKillReason, ConversationStatus, TimestampMs, now_ms};
 use aionui_session::{
-    BackendError, Command, CommandMeta, ContentBlock, ModeInfo, ModelInfo, SessionBackend, SessionEnvelope,
-    SessionEvent, ToolResultContent,
+    BackendError, Command, CommandMeta, ContentBlock, ModeInfo, ModelInfo, NativeGoal as SessionNativeGoal,
+    NativeGoalStatus as SessionNativeGoalStatus, NativeGoalUpdate, SessionBackend, SessionEnvelope, SessionEvent,
+    ToolResultContent,
 };
 use futures_util::stream::BoxStream;
 use tokio::sync::broadcast;
@@ -32,7 +33,10 @@ use crate::protocol::events::{
 use crate::protocol::send_error::AgentSendError;
 use crate::shared_kernel::PersistedSessionState;
 use crate::types::{PromptMediaCaps, SendMessageData};
-use aionui_api_types::{AcpBuildExtra, TEAM_MCP_SERVER_NAME};
+use aionui_api_types::{
+    AcpBuildExtra, NativeGoalCapabilities, NativeGoalSnapshot, NativeGoalStateResponse, NativeGoalStatus,
+    SetNativeGoalRequest, TEAM_MCP_SERVER_NAME,
+};
 use aionui_common::AgentType;
 use aionui_db::{IAcpSessionRepository, IMcpServerRepository, SaveRuntimeStateParams};
 use aionui_realtime::EventBroadcaster;
@@ -1285,6 +1289,164 @@ impl SessionAgentTask {
             })
             .collect())
     }
+
+    /// Read the provider-owned goal over the existing direct CLI/app-server
+    /// process. This must not create a second harness or shadow goal state in
+    /// AionUi: unsupported session providers remain honestly unsupported.
+    pub async fn get_native_goal(&self) -> Result<NativeGoalStateResponse, AgentError> {
+        let provider = self.backend.provider_name();
+        match self.backend.native_goal_get().await {
+            Ok(goal) => Ok(session_native_goal_response(provider, goal, None)),
+            Err(BackendError::CommandNotSupported { .. }) => Ok(NativeGoalStateResponse::unsupported(provider)),
+            Err(error) => Err(AgentError::bad_gateway(error.to_string())),
+        }
+    }
+
+    /// Partially mutate the provider-owned goal. `clear_token_budget` maps to
+    /// the nested `Some(None)` representation so it reaches Codex as JSON null.
+    pub async fn set_native_goal(&self, request: &SetNativeGoalRequest) -> Result<NativeGoalStateResponse, AgentError> {
+        let update = api_goal_update_to_session(request);
+        match self.backend.native_goal_set(update).await {
+            Ok(goal) => Ok(session_native_goal_response(
+                self.backend.provider_name(),
+                Some(goal),
+                None,
+            )),
+            Err(BackendError::CommandNotSupported { .. }) => Err(AgentError::conflict(
+                "This agent does not expose structured native goal control",
+            )),
+            Err(error) => Err(AgentError::bad_gateway(error.to_string())),
+        }
+    }
+
+    pub async fn clear_native_goal(&self) -> Result<NativeGoalStateResponse, AgentError> {
+        match self.backend.native_goal_clear().await {
+            Ok(cleared) => Ok(session_native_goal_response(
+                self.backend.provider_name(),
+                None,
+                Some(cleared),
+            )),
+            Err(BackendError::CommandNotSupported { .. }) => Err(AgentError::conflict(
+                "This agent does not expose structured native goal control",
+            )),
+            Err(error) => Err(AgentError::bad_gateway(error.to_string())),
+        }
+    }
+}
+
+fn api_goal_update_to_session(request: &SetNativeGoalRequest) -> NativeGoalUpdate {
+    NativeGoalUpdate {
+        objective: request.objective.as_ref().map(|value| value.trim().to_owned()),
+        status: request.status.map(api_goal_status_to_session),
+        token_budget: if request.clear_token_budget {
+            Some(None)
+        } else {
+            request.token_budget.map(Some)
+        },
+    }
+}
+
+fn api_goal_status_to_session(status: NativeGoalStatus) -> SessionNativeGoalStatus {
+    match status {
+        NativeGoalStatus::Active => SessionNativeGoalStatus::Active,
+        NativeGoalStatus::Paused => SessionNativeGoalStatus::Paused,
+        NativeGoalStatus::Blocked => SessionNativeGoalStatus::Blocked,
+        NativeGoalStatus::UsageLimited => SessionNativeGoalStatus::UsageLimited,
+        NativeGoalStatus::BudgetLimited => SessionNativeGoalStatus::BudgetLimited,
+        NativeGoalStatus::Complete => SessionNativeGoalStatus::Complete,
+    }
+}
+
+fn session_goal_status_to_api(status: SessionNativeGoalStatus) -> NativeGoalStatus {
+    match status {
+        SessionNativeGoalStatus::Active => NativeGoalStatus::Active,
+        SessionNativeGoalStatus::Paused => NativeGoalStatus::Paused,
+        SessionNativeGoalStatus::Blocked => NativeGoalStatus::Blocked,
+        SessionNativeGoalStatus::UsageLimited => NativeGoalStatus::UsageLimited,
+        SessionNativeGoalStatus::BudgetLimited => NativeGoalStatus::BudgetLimited,
+        SessionNativeGoalStatus::Complete => NativeGoalStatus::Complete,
+    }
+}
+
+fn session_native_goal_response(
+    provider: impl Into<String>,
+    goal: Option<SessionNativeGoal>,
+    cleared: Option<bool>,
+) -> NativeGoalStateResponse {
+    NativeGoalStateResponse {
+        provider: provider.into(),
+        capabilities: NativeGoalCapabilities::structured_tokens(),
+        goal: goal.map(|goal| NativeGoalSnapshot {
+            thread_id: goal.thread_id,
+            objective: goal.objective,
+            status: session_goal_status_to_api(goal.status),
+            token_budget: goal.token_budget,
+            tokens_used: goal.tokens_used,
+            time_used_seconds: goal.time_used_seconds,
+            created_at: goal.created_at,
+            updated_at: goal.updated_at,
+        }),
+        cleared,
+    }
+}
+
+#[cfg(test)]
+mod native_goal_conversion_tests {
+    use super::*;
+
+    #[test]
+    fn native_goal_status_and_snapshot_preserve_all_provider_states() {
+        for (session, api) in [
+            (SessionNativeGoalStatus::Active, NativeGoalStatus::Active),
+            (SessionNativeGoalStatus::Paused, NativeGoalStatus::Paused),
+            (SessionNativeGoalStatus::Blocked, NativeGoalStatus::Blocked),
+            (SessionNativeGoalStatus::UsageLimited, NativeGoalStatus::UsageLimited),
+            (SessionNativeGoalStatus::BudgetLimited, NativeGoalStatus::BudgetLimited),
+            (SessionNativeGoalStatus::Complete, NativeGoalStatus::Complete),
+        ] {
+            assert_eq!(session_goal_status_to_api(session), api);
+            assert_eq!(api_goal_status_to_session(api), session);
+        }
+
+        let state = session_native_goal_response(
+            "codex",
+            Some(SessionNativeGoal {
+                thread_id: "thread-1".into(),
+                objective: "Finish integration".into(),
+                status: SessionNativeGoalStatus::UsageLimited,
+                token_budget: Some(42_000),
+                tokens_used: 7,
+                time_used_seconds: 3,
+                created_at: 1,
+                updated_at: 2,
+            }),
+            None,
+        );
+        assert_eq!(state.provider, "codex");
+        assert_eq!(state.goal.unwrap().status, NativeGoalStatus::UsageLimited);
+        assert_eq!(state.capabilities, NativeGoalCapabilities::structured_tokens());
+    }
+
+    #[test]
+    fn native_goal_update_distinguishes_budget_clear_from_omission() {
+        let clear = api_goal_update_to_session(&SetNativeGoalRequest {
+            objective: Some("  Trim me  ".into()),
+            status: Some(NativeGoalStatus::Paused),
+            token_budget: None,
+            clear_token_budget: true,
+        });
+        assert_eq!(clear.objective.as_deref(), Some("Trim me"));
+        assert_eq!(clear.status, Some(SessionNativeGoalStatus::Paused));
+        assert_eq!(clear.token_budget, Some(None));
+
+        let omitted = api_goal_update_to_session(&SetNativeGoalRequest {
+            objective: None,
+            status: None,
+            token_budget: None,
+            clear_token_budget: false,
+        });
+        assert_eq!(omitted.token_budget, None);
+    }
 }
 
 #[async_trait::async_trait]
@@ -2159,24 +2321,59 @@ fn resolve_session_cli_program(
     backend_label: &str,
     metadata: &aionui_api_types::AgentMetadata,
 ) -> Option<std::path::PathBuf> {
-    if metadata.has_command_override {
-        return metadata.resolved_command.clone().or_else(|| {
+    let program = if metadata.has_command_override {
+        metadata.resolved_command.clone().or_else(|| {
             metadata
                 .command
                 .as_deref()
                 .map(str::trim)
                 .filter(|command| !command.is_empty())
                 .map(std::path::PathBuf::from)
-        });
+        })
+    } else {
+        // PATH only. claude/codex used to prefer a bundled, version-pinned copy,
+        // which silently diverged from whatever the user had installed: the same
+        // prompt behaved differently in AionUi and in the user's terminal, with
+        // nothing on screen explaining why. They are now treated exactly like agy —
+        // the user's own install is the one that runs, and a drift from the version
+        // this integration was verified against is reported rather than hidden.
+        aionui_runtime::resolve_command_path(backend_label)
+    };
+
+    program.map(|program| canonicalize_codex_cli_program(backend_label, program))
+}
+
+/// Codex locates companion executables such as `codex-code-mode-host` next to
+/// the CLI path it was launched through. A PATH entry can be a symlink outside
+/// the actual installation directory (for example `~/.local/bin/codex` pointing
+/// into an app bundle), which makes the companion lookup target the symlink's
+/// directory and fail even though the companion is installed. Launch Codex via
+/// its canonical path so its native harness remains intact.
+fn canonicalize_codex_cli_program(backend_label: &str, program: std::path::PathBuf) -> std::path::PathBuf {
+    if backend_label != "codex" {
+        return program;
     }
 
-    // PATH only. claude/codex used to prefer a bundled, version-pinned copy,
-    // which silently diverged from whatever the user had installed: the same
-    // prompt behaved differently in AionUi and in the user's terminal, with
-    // nothing on screen explaining why. They are now treated exactly like agy —
-    // the user's own install is the one that runs, and a drift from the version
-    // this integration was verified against is reported rather than hidden.
-    aionui_runtime::resolve_command_path(backend_label)
+    match std::fs::canonicalize(&program) {
+        Ok(canonical) => {
+            if canonical != program {
+                tracing::info!(
+                    launch_path = %program.display(),
+                    canonical_path = %canonical.display(),
+                    "codex: canonicalized CLI launch path for companion executable discovery"
+                );
+            }
+            canonical
+        }
+        Err(error) => {
+            tracing::debug!(
+                launch_path = %program.display(),
+                error = %error,
+                "codex: CLI launch path canonicalization unavailable; preserving resolved path"
+            );
+            program
+        }
+    }
 }
 
 /// Assemble the direct-CLI spawn env (legacy spawn-surface parity; order
@@ -5064,6 +5261,41 @@ mod build_mapping_tests {
             resolve_session_cli_program("claude", &metadata),
             Some(std::path::PathBuf::from("/custom/claude"))
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_session_cli_program_resolves_symlink_for_companion_discovery() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let install_dir = temp.path().join("Codex.app/Contents/Resources");
+        let path_dir = temp.path().join("bin");
+        std::fs::create_dir_all(&install_dir).unwrap();
+        std::fs::create_dir_all(&path_dir).unwrap();
+        let installed_codex = install_dir.join("codex");
+        std::fs::write(&installed_codex, b"codex").unwrap();
+        let path_codex = path_dir.join("codex");
+        symlink(&installed_codex, &path_codex).unwrap();
+
+        let mut metadata = test_metadata(Some("codex"), None);
+        metadata.has_command_override = true;
+        metadata.resolved_command = Some(path_codex);
+
+        assert_eq!(
+            resolve_session_cli_program("codex", &metadata),
+            Some(std::fs::canonicalize(installed_codex).unwrap())
+        );
+    }
+
+    #[test]
+    fn codex_session_cli_program_preserves_missing_override_for_diagnostics() {
+        let missing = std::path::PathBuf::from("/aionui/missing/codex");
+        let mut metadata = test_metadata(Some("codex"), None);
+        metadata.has_command_override = true;
+        metadata.resolved_command = Some(missing.clone());
+
+        assert_eq!(resolve_session_cli_program("codex", &metadata), Some(missing));
     }
 
     #[test]

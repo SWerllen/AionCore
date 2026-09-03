@@ -4,8 +4,8 @@ use aionui_db::models::AgentMetadataRow;
 use aionui_db::{IAgentMetadataRepository, resolve_agent_binding_from_rows};
 use std::sync::Arc;
 
-use crate::ports::TeamAssistantCatalogEntry;
-use crate::prompts::AvailableAssistant;
+use crate::ports::{TeamAssistantCatalogEntry, TeamWorkerProfile};
+use crate::prompts::{AvailableAssistant, AvailableWorkerProfile};
 
 use crate::provisioning::PersistSpawnedAgentRequest;
 
@@ -103,49 +103,34 @@ impl TeamSessionService {
             })
     }
 
-    pub(crate) async fn resolve_spawn_backend_and_model(
+    pub(crate) async fn resolve_spawn_target(
         &self,
         user_id: &str,
-        assistant_id: Option<&str>,
-        requested_model: Option<&str>,
-        fallback_backend: &str,
-        fallback_model: &str,
-    ) -> Result<(String, String), TeamError> {
-        if let Some(assistant_id) = assistant_id.map(str::trim).filter(|value| !value.is_empty()) {
-            let selectable = self.resolve_team_selectable_assistant(user_id, assistant_id).await?;
-            let definition = self
-                .assistant_definition_repo
-                .get_by_assistant_id_for_user(user_id, assistant_id)
-                .await?
-                .ok_or_else(|| TeamError::InvalidRequest(format!("Preset assistant not found: {assistant_id}")))?;
-            let backend = selectable.backend;
-            let requested_model = requested_model
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_owned);
-            let fixed_model = (definition.default_model_mode == "fixed")
-                .then(|| definition.default_model_value.clone())
-                .flatten()
-                .map(|value| value.trim().to_owned())
-                .filter(|value| !value.is_empty());
-            let backend_default_model = self.default_model_for_backend(user_id, &backend).await;
-            let model = requested_model
-                .or(fixed_model)
-                .or(backend_default_model)
-                .unwrap_or_else(|| fallback_model.to_owned());
-            return Ok((backend, model));
-        }
-
-        let backend = fallback_backend.to_owned();
-        let requested_model = requested_model
+        assistant_id: &str,
+        worker_profile_id: Option<&str>,
+    ) -> Result<(String, String, Option<TeamWorkerProfile>), TeamError> {
+        let worker_profile_id = worker_profile_id
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .map(str::to_owned);
-        let backend_default_model = self.default_model_for_backend(user_id, &backend).await;
-        let model = requested_model
-            .or(backend_default_model)
-            .unwrap_or_else(|| fallback_model.to_owned());
-        Ok((backend, model))
+            .ok_or_else(|| {
+                TeamError::InvalidRequest(format!("Worker profile is required for assistant '{assistant_id}'"))
+            })?;
+        let selectable = self.resolve_team_selectable_assistant(user_id, assistant_id).await?;
+        let profile = selectable
+            .worker_profiles
+            .into_iter()
+            .find(|profile| profile.worker_profile_id == worker_profile_id)
+            .ok_or_else(|| {
+                TeamError::InvalidRequest(format!(
+                    "Worker profile is not available for assistant '{assistant_id}': {worker_profile_id}"
+                ))
+            })?;
+        if !profile.enabled {
+            return Err(TeamError::InvalidRequest(format!(
+                "Worker profile is disabled for assistant '{assistant_id}': {worker_profile_id}"
+            )));
+        }
+        Ok((selectable.backend, profile.model_id.clone(), Some(profile)))
     }
 
     /// Return all enabled assistants that can currently participate in team mode.
@@ -158,51 +143,35 @@ impl TeamSessionService {
 
         assistants
             .into_iter()
-            .map(|assistant| AvailableAssistant {
-                assistant_id: assistant.assistant_id,
-                name: assistant.name,
-                backend: assistant.backend,
-                description: assistant.description,
-                skills: assistant.skills,
+            .filter_map(|assistant| {
+                let worker_profiles = assistant
+                    .worker_profiles
+                    .into_iter()
+                    .filter(|profile| profile.enabled)
+                    .map(|profile| AvailableWorkerProfile {
+                        worker_profile_id: profile.worker_profile_id,
+                        name: profile.name,
+                        model_id: profile.model_id,
+                        reasoning_effort: profile.reasoning_effort,
+                        context_window: profile.context_window,
+                        difficulty_ceiling: profile.difficulty_ceiling,
+                        estimated_cost_micros: profile.estimated_cost_micros,
+                        currency: profile.currency,
+                    })
+                    .collect::<Vec<_>>();
+                if worker_profiles.is_empty() {
+                    return None;
+                }
+                Some(AvailableAssistant {
+                    assistant_id: assistant.assistant_id,
+                    name: assistant.name,
+                    backend: assistant.backend,
+                    description: assistant.description,
+                    skills: assistant.skills,
+                    worker_profiles,
+                })
             })
             .collect()
-    }
-
-    /// Collect all enabled provider model IDs grouped by provider name.
-    /// Returns a flat list of model IDs for use by internal agents (aionrs).
-    async fn collect_provider_models(&self, user_id: &str) -> Vec<String> {
-        let Ok(providers) = self.provider_repo.list(user_id).await else {
-            return vec![];
-        };
-        providers
-            .into_iter()
-            .filter(|p| p.enabled)
-            .flat_map(|p| serde_json::from_str::<Vec<String>>(&p.models).unwrap_or_default())
-            .collect()
-    }
-
-    pub(crate) async fn default_model_for_backend(&self, user_id: &str, backend: &str) -> Option<String> {
-        if backend == "aionrs" {
-            return self.collect_provider_models(user_id).await.into_iter().next();
-        }
-        let row = self
-            .agent_metadata_repo
-            .find_builtin_by_backend_for_user(user_id, backend)
-            .await
-            .ok()??;
-        let json: serde_json::Value = serde_json::from_str(row.available_models.as_deref()?).ok()?;
-        if let Some(id) = json.get("current_model_id").and_then(|v| v.as_str())
-            && !id.is_empty()
-        {
-            return Some(id.to_owned());
-        }
-        let arr = json
-            .get("available_models")
-            .and_then(|v| v.as_array())
-            .or_else(|| json.as_array())?;
-        arr.first()
-            .and_then(|e| e.get("id").and_then(|v| v.as_str()))
-            .map(|s| s.to_owned())
     }
 
     pub async fn spawn_agent_in_session(
@@ -840,6 +809,7 @@ mod tests {
             backend: backend.into(),
             description: String::new(),
             skills: Vec::new(),
+            worker_profiles: Vec::new(),
         }
     }
 
@@ -989,17 +959,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_team_selectable_assistants_uses_assistant_projection_catalog() {
+    async fn list_team_selectable_assistants_requires_an_enabled_worker_profile() {
         let (base, _, _, _) = setup_with_factory_metadata_team_repo_and_conversation_repo();
+        let mut selectable = team_assistant_entry("assistant-unchecked", "Unchecked Assistant", "cursor");
+        selectable.worker_profiles.push(crate::ports::TeamWorkerProfile {
+            worker_profile_id: "profile-enabled".into(),
+            name: "Enabled profile".into(),
+            model_id: "cursor-model".into(),
+            reasoning_effort: None,
+            context_window: None,
+            difficulty_ceiling: 3,
+            estimated_cost_micros: 1_000_000,
+            currency: "CNY".into(),
+            enabled: true,
+        });
         let svc = TeamSessionService::new(
             base.repo.clone(),
             Arc::new(RowsAgentMetadataRepo { rows: vec![] }),
             Arc::new(RowsTeamAssistantCatalog {
-                rows: vec![team_assistant_entry(
-                    "assistant-unchecked",
-                    "Unchecked Assistant",
-                    "cursor",
-                )],
+                rows: vec![
+                    selectable,
+                    team_assistant_entry("assistant-without-profiles", "No Profile", "cursor"),
+                ],
             }),
             Arc::new(MultiAssistantDefinitionRepo { rows: vec![] }),
             Arc::new(MultiAssistantOverlayRepo { rows: vec![] }),
@@ -1071,21 +1052,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_spawn_backend_and_model_rejects_assistant_missing_from_team_selectable_catalog() {
-        let svc = service_with_selectable_catalog(vec![], vec![assistant_definition("word-creator", "aionrs")]);
-
-        let err = svc
-            .resolve_spawn_backend_and_model("user1", Some("word-creator"), None, "gemini", "gemini-2.5-pro")
-            .await
-            .expect_err("spawn must reject assistants outside the team-selectable catalog");
-
-        assert!(
-            matches!(&err, TeamError::InvalidRequest(msg) if msg.contains("not available for team mode")),
-            "expected team-selectable assistant error, got {err:?}"
-        );
-    }
-
-    #[tokio::test]
     async fn persist_spawned_agent_uses_team_workspace_resolver() {
         let (svc, team_repo, _, conv_repo) = setup_with_factory_metadata_team_repo_and_conversation_repo();
         let created = svc
@@ -1108,6 +1074,7 @@ mod tests {
                 backend: "acp".into(),
                 model: "claude".into(),
                 assistant_id: None,
+                worker_profile: None,
             })
             .await
             .unwrap();
@@ -1122,78 +1089,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_spawn_backend_and_model_prefers_assistant_identity_over_caller_backend() {
-        let (svc, _, _, _) = setup_with_factory_metadata_team_repo_and_conversation_repo();
-        let svc = TeamSessionService::new(
-            svc.repo.clone(),
-            svc.agent_metadata_repo.clone(),
-            Arc::new(RowsTeamAssistantCatalog {
-                rows: vec![team_assistant_entry("word-creator", "Word Creator", "aionrs")],
-            }),
-            Arc::new(SingleAssistantDefinitionRepo {
-                row: AssistantDefinitionRow {
-                    id: "def-1".into(),
-                    assistant_id: "word-creator".into(),
-                    source: "builtin".into(),
-                    owner_type: "system".into(),
-                    source_ref: Some("word-creator".into()),
-                    name: "Word Creator".into(),
-                    name_i18n: "{}".into(),
-                    description: None,
-                    description_i18n: "{}".into(),
-                    avatar_type: "emoji".into(),
-                    avatar_value: None,
-                    agent_id: "aionrs".into(),
-                    rule_resource_type: "none".into(),
-                    rule_resource_ref: None,
-                    recommended_prompts: "[]".into(),
-                    recommended_prompts_i18n: "{}".into(),
-                    default_model_mode: "auto".into(),
-                    default_model_value: None,
-                    default_permission_mode: "auto".into(),
-                    default_permission_value: None,
-                    default_thought_level_mode: "auto".into(),
-                    default_thought_level_value: None,
-                    default_skills_mode: "auto".into(),
-                    default_skill_ids: "[]".into(),
-                    custom_skill_names: "[]".into(),
-                    default_disabled_builtin_skill_ids: "[]".into(),
-                    default_mcps_mode: "auto".into(),
-                    default_mcp_ids: "[]".into(),
-                    created_at: 0,
-                    updated_at: 0,
-                    deleted_at: None,
-                },
-            }),
-            Arc::new(SingleAssistantOverlayRepo {
-                row: AssistantOverlayRow {
-                    assistant_definition_id: "def-1".into(),
-                    enabled: true,
-                    sort_order: 0,
-                    agent_id_override: None,
-                    last_used_at: None,
-                    created_at: 0,
-                    updated_at: 0,
-                },
-            }),
-            Arc::new(SingleProviderRepo {
-                rows: vec![provider_row("openai", &["gpt-5-mini"])],
-            }),
-            svc.conversation_port.clone(),
-            svc.projection_store.clone(),
-            svc.broadcaster.clone(),
-            svc.task_manager.clone(),
-            svc.turn_port.clone(),
-            svc.cancellation_port.clone(),
-            svc.backend_binary_path.clone(),
-        );
+    async fn resolve_spawn_target_applies_exact_priced_worker_profile() {
+        let mut assistant = team_assistant_entry("word-creator", "Word Creator", "codex");
+        assistant.worker_profiles.push(crate::ports::TeamWorkerProfile {
+            worker_profile_id: "profile-high".into(),
+            name: "High reasoning".into(),
+            model_id: "gpt-profile".into(),
+            reasoning_effort: Some("high".into()),
+            context_window: Some(128_000),
+            difficulty_ceiling: 4,
+            estimated_cost_micros: 12_500_000,
+            currency: "CNY".into(),
+            enabled: true,
+        });
+        let svc = service_with_selectable_catalog(vec![assistant], vec![assistant_definition("word-creator", "codex")]);
 
-        let (backend, model) = svc
-            .resolve_spawn_backend_and_model("user1", Some("word-creator"), None, "gemini", "gemini-2.5-pro")
+        let (backend, model, profile) = svc
+            .resolve_spawn_target("user1", "word-creator", Some("profile-high"))
             .await
             .unwrap();
 
-        assert_eq!(backend, "aionrs");
-        assert_eq!(model, "gpt-5-mini");
+        assert_eq!(backend, "codex");
+        assert_eq!(model, "gpt-profile");
+        let profile = profile.expect("selected profile");
+        assert_eq!(profile.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(profile.context_window, Some(128_000));
+        assert_eq!(profile.estimated_cost_micros, 12_500_000);
+    }
+
+    #[tokio::test]
+    async fn resolve_spawn_target_rejects_missing_worker_profile() {
+        let mut assistant = team_assistant_entry("word-creator", "Word Creator", "codex");
+        assistant.worker_profiles.push(crate::ports::TeamWorkerProfile {
+            worker_profile_id: "profile-high".into(),
+            name: "High reasoning".into(),
+            model_id: "gpt-profile".into(),
+            reasoning_effort: Some("high".into()),
+            context_window: Some(128_000),
+            difficulty_ceiling: 4,
+            estimated_cost_micros: 12_500_000,
+            currency: "CNY".into(),
+            enabled: true,
+        });
+        let svc = service_with_selectable_catalog(vec![assistant], vec![assistant_definition("word-creator", "codex")]);
+
+        let error = svc
+            .resolve_spawn_target("user1", "word-creator", None)
+            .await
+            .expect_err("worker template must be mandatory");
+
+        assert!(error.to_string().contains("Worker profile is required"));
     }
 }

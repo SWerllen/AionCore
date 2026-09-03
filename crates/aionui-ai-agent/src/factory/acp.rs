@@ -12,7 +12,9 @@ use crate::session_context::AcpSessionBuildContext;
 use agent_client_protocol::schema::v1::{
     EnvVariable, HttpHeader, McpServer, McpServerHttp, McpServerSse, McpServerStdio,
 };
-use aionui_api_types::{AgentMetadata, SessionMcpServer, SessionMcpTransport, TEAM_MCP_SERVER_NAME};
+use aionui_api_types::{
+    AgentMetadata, STEWARD_MCP_SERVER_NAME, SessionMcpServer, SessionMcpTransport, TEAM_MCP_SERVER_NAME,
+};
 use aionui_common::CommandSpec;
 use aionui_db::IMcpServerRepository;
 use aionui_db::models::McpServerRow;
@@ -48,6 +50,108 @@ fn configured_non_acp_routes() -> &'static [(&'static str, BackendRoute)] {
     CONFIGURED_NON_ACP_ROUTES
 }
 
+fn suppress_aionui_managed_capabilities(
+    config: &mut aionui_api_types::AcpBuildExtra,
+    policy: &aionui_api_types::BehaviorPolicy,
+) -> (usize, usize) {
+    let suppress_skills = policy.skill_policy == aionui_api_types::SkillPolicy::NativeOnly;
+    let suppress_mcp = policy.mcp_policy == aionui_api_types::McpPolicy::NativePlusTeam;
+
+    let suppressed_skill_count = if suppress_skills { config.skills.len() } else { 0 };
+    let suppressed_mcp_count = if suppress_mcp {
+        config.mcp_server_ids.as_ref().map_or(0, Vec::len)
+            + config
+                .session_mcp_servers
+                .iter()
+                .filter(|server| {
+                    !(config.steward
+                        && (server.id == STEWARD_MCP_SERVER_NAME || server.name == STEWARD_MCP_SERVER_NAME))
+                })
+                .count()
+    } else {
+        0
+    };
+
+    if suppress_skills {
+        config.skills.clear();
+    }
+    if suppress_mcp {
+        config.mcp_server_ids = Some(Vec::new());
+        if config.steward {
+            config
+                .session_mcp_servers
+                .retain(|server| server.id == STEWARD_MCP_SERVER_NAME || server.name == STEWARD_MCP_SERVER_NAME);
+        } else {
+            config.session_mcp_servers.clear();
+        }
+    }
+
+    (suppressed_skill_count, suppressed_mcp_count)
+}
+
+fn apply_capability_policy(config: &mut aionui_api_types::AcpBuildExtra, metadata: &AgentMetadata) {
+    let (suppressed_skill_count, suppressed_mcp_count) =
+        suppress_aionui_managed_capabilities(config, &metadata.behavior_policy);
+    let suppress_skills = metadata.behavior_policy.skill_policy == aionui_api_types::SkillPolicy::NativeOnly;
+    let suppress_mcp = metadata.behavior_policy.mcp_policy == aionui_api_types::McpPolicy::NativePlusTeam;
+
+    if suppress_skills || suppress_mcp {
+        info!(
+            backend = metadata.backend.as_deref().unwrap_or("unknown"),
+            skill_policy = ?metadata.behavior_policy.skill_policy,
+            mcp_policy = ?metadata.behavior_policy.mcp_policy,
+            harness_policy = ?metadata.behavior_policy.harness_policy,
+            suppressed_skill_count,
+            suppressed_mcp_count,
+            team_mcp_preserved = config.team_mcp_stdio_config.is_some(),
+            steward_mcp_preserved = config.steward && !config.session_mcp_servers.is_empty(),
+            "agent capability policy applied before session launch"
+        );
+    }
+}
+
+/// A steward is a control-plane role, never a team leader or a domain worker.
+/// Apply this independently of the selected Assistant's ordinary capability
+/// policy so a legacy/polluted steward row cannot re-enable user or team tools.
+fn isolate_steward_capabilities(config: &mut aionui_api_types::AcpBuildExtra) {
+    if !config.steward {
+        return;
+    }
+    config.skills.clear();
+    config.mcp_server_ids = Some(Vec::new());
+    config
+        .session_mcp_servers
+        .retain(|server| server.id == STEWARD_MCP_SERVER_NAME || server.name == STEWARD_MCP_SERVER_NAME);
+    config.team_mcp_stdio_config = None;
+}
+
+/// Add the short-lived conversation runtime context only to the in-memory
+/// steward MCP launch spec. The persisted conversation snapshot deliberately
+/// keeps an empty env map so runtime credentials never become durable data.
+///
+/// Codex launches configured MCP subprocesses with the explicit MCP env map,
+/// not the app-server's complete inherited environment. Without this boundary
+/// merge the server exits before initialize because its runtime token is absent.
+fn inject_steward_runtime_env(config: &mut aionui_api_types::AcpBuildExtra, runtime_env: &[(String, String)]) -> usize {
+    if !config.steward {
+        return 0;
+    }
+    let mut injected = 0;
+    for server in &mut config.session_mcp_servers {
+        if server.id != STEWARD_MCP_SERVER_NAME && server.name != STEWARD_MCP_SERVER_NAME {
+            continue;
+        }
+        let SessionMcpTransport::Stdio { env, .. } = &mut server.transport else {
+            continue;
+        };
+        for (name, value) in runtime_env.iter().filter(|(name, _)| name.starts_with("AIONUI_")) {
+            env.insert(name.clone(), value.clone());
+            injected += 1;
+        }
+    }
+    injected
+}
+
 pub(crate) fn route_for_backend(backend: Option<&str>) -> BackendRoute {
     backend
         .and_then(|backend| {
@@ -79,6 +183,48 @@ pub(super) async fn build(
     if config.agent_id.is_some() || config.backend.is_none() {
         config.backend.clone_from(&meta.backend);
     }
+
+    apply_capability_policy(&mut config, &meta);
+    isolate_steward_capabilities(&mut config);
+    let steward_runtime_env_count = inject_steward_runtime_env(&mut config, &ctx.runtime_env);
+    if steward_runtime_env_count > 0 {
+        info!(
+            conversation_id = %ctx.conversation_id,
+            steward_runtime_env_count,
+            "steward control MCP received ephemeral runtime context"
+        );
+    }
+
+    // The ordinary assistant policy deliberately lets Codex/Qoder discover
+    // their own native capabilities. The steward is different: it coordinates
+    // work but does not perform it, so launch it from a private HOME, config
+    // root, and workspace. Only the provider login file is linked in; the
+    // steward control MCP continues to arrive through session/new below.
+    let steward_isolation = if config.steward {
+        match config.backend.as_deref() {
+            Some(backend) => {
+                crate::steward_isolation::StewardIsolation::prepare(&deps.data_dir, &ctx.user_id, backend)?
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+    let mut runtime_env = ctx.runtime_env.clone();
+    let workspace = if let Some(isolation) = steward_isolation.as_ref() {
+        isolation.append_spawn_env(&mut runtime_env);
+        config.preset_context = Some(isolation.extend_preset_context(config.preset_context.take()));
+        info!(
+            conversation_id = %ctx.conversation_id,
+            backend = config.backend.as_deref().unwrap_or("unknown"),
+            auth_linked = isolation.auth_linked(),
+            workspace = %isolation.workspace(),
+            "steward isolated CLI runtime prepared"
+        );
+        isolation.workspace()
+    } else {
+        ctx.workspace.clone()
+    };
 
     if matches!(route_for_backend(config.backend.as_deref()), BackendRoute::Antigravity) {
         // Product decision: antigravity has no fork surface. The fork API's
@@ -125,7 +271,7 @@ pub(super) async fn build(
             crate::session_agent::SessionBuildInputs {
                 conversation_id: ctx.conversation_id.clone(),
                 user_id: ctx.user_id.clone(),
-                workspace: ctx.workspace.clone(),
+                workspace: workspace.clone(),
                 config: &config,
                 metadata: &meta,
                 skill_delivery: delivery,
@@ -135,7 +281,7 @@ pub(super) async fn build(
                 // The AIONUI_* conversation runtime context the legacy path
                 // injects via apply_acp_launch_policy — forwarded into
                 // SessionConfig.spawn_env so direct-CLI spawns get it too.
-                runtime_env: &ctx.runtime_env,
+                runtime_env: &runtime_env,
                 broadcaster: deps.broadcaster.clone(),
                 // G5: keyed by the resolved catalog row so the discovered
                 // modes/models/commands refresh the `/api/agents` picker (the
@@ -173,7 +319,7 @@ pub(super) async fn build(
     let mut command_spec = resolve_agent_command_spec(
         &meta,
         &ctx.user_id,
-        &ctx.workspace,
+        &workspace,
         &ctx.conversation_id,
         deps.broadcaster.clone(),
     )
@@ -184,9 +330,12 @@ pub(super) async fn build(
             metadata: &meta,
             config: &config,
             session_snapshot: build_context.session_snapshot.as_ref(),
-            runtime_env: &ctx.runtime_env,
+            runtime_env: &runtime_env,
         },
     );
+    if let Some(isolation) = steward_isolation.as_ref() {
+        isolation.apply_to_acp_command(&mut command_spec);
+    }
 
     // Skill delivery args for the ACP lane. These come straight from
     // `agent_metadata`, so giving a newly probed vendor an equivalent flag is a
@@ -270,8 +419,8 @@ pub(super) async fn build(
             ctx.conversation_id.clone(),
             ctx.user_id.clone(),
             WorkspaceInfo {
-                path: ctx.workspace,
-                is_custom: ctx.is_custom_workspace,
+                path: workspace,
+                is_custom: ctx.is_custom_workspace || steward_isolation.is_some(),
             },
             meta,
             command_spec,
@@ -652,6 +801,192 @@ mod tests {
     };
 
     const TEST_USER_ID: &str = "user-1";
+
+    #[test]
+    fn native_capability_policy_suppresses_user_capabilities_but_keeps_team_mcp() {
+        let mut config = AcpBuildExtra {
+            skills: vec!["review".into()],
+            mcp_server_ids: Some(vec!["user-mcp".into()]),
+            session_mcp_servers: vec![SessionMcpServer {
+                id: "builtin-mcp".into(),
+                name: "builtin".into(),
+                transport: SessionMcpTransport::Stdio {
+                    command: "tool".into(),
+                    args: Vec::new(),
+                    env: std::collections::HashMap::new(),
+                },
+            }],
+            team_mcp_stdio_config: Some(aionui_api_types::TeamMcpStdioConfig {
+                team_id: "team-1".into(),
+                port: 4242,
+                token: "token".into(),
+                slot_id: "slot-1".into(),
+                binary_path: "/tmp/aionui".into(),
+            }),
+            ..Default::default()
+        };
+        let policy = aionui_api_types::BehaviorPolicy {
+            skill_policy: aionui_api_types::SkillPolicy::NativeOnly,
+            mcp_policy: aionui_api_types::McpPolicy::NativePlusTeam,
+            harness_policy: aionui_api_types::HarnessPolicy::Preserve,
+            ..Default::default()
+        };
+
+        let suppressed = suppress_aionui_managed_capabilities(&mut config, &policy);
+
+        assert_eq!(suppressed, (1, 2));
+        assert!(config.skills.is_empty());
+        assert_eq!(config.mcp_server_ids, Some(Vec::new()));
+        assert!(config.session_mcp_servers.is_empty());
+        assert!(config.team_mcp_stdio_config.is_some());
+    }
+
+    #[test]
+    fn default_capability_policy_keeps_user_capabilities() {
+        let mut config = AcpBuildExtra {
+            skills: vec!["review".into()],
+            mcp_server_ids: Some(vec!["user-mcp".into()]),
+            ..Default::default()
+        };
+
+        let suppressed =
+            suppress_aionui_managed_capabilities(&mut config, &aionui_api_types::BehaviorPolicy::default());
+
+        assert_eq!(suppressed, (0, 0));
+        assert_eq!(config.skills, vec!["review"]);
+        assert_eq!(config.mcp_server_ids, Some(vec!["user-mcp".into()]));
+    }
+
+    #[test]
+    fn native_capability_policy_keeps_only_steward_control_mcp_for_steward() {
+        let mut config = AcpBuildExtra {
+            steward: true,
+            mcp_server_ids: Some(vec!["user-mcp".into()]),
+            session_mcp_servers: vec![
+                SessionMcpServer {
+                    id: STEWARD_MCP_SERVER_NAME.into(),
+                    name: STEWARD_MCP_SERVER_NAME.into(),
+                    transport: SessionMcpTransport::Stdio {
+                        command: "aioncore".into(),
+                        args: vec!["mcp-steward-stdio".into()],
+                        env: std::collections::HashMap::new(),
+                    },
+                },
+                SessionMcpServer {
+                    id: "ordinary".into(),
+                    name: "ordinary".into(),
+                    transport: SessionMcpTransport::Stdio {
+                        command: "ordinary-tool".into(),
+                        args: Vec::new(),
+                        env: std::collections::HashMap::new(),
+                    },
+                },
+            ],
+            ..Default::default()
+        };
+        let policy = aionui_api_types::BehaviorPolicy {
+            mcp_policy: aionui_api_types::McpPolicy::NativePlusTeam,
+            ..Default::default()
+        };
+
+        let suppressed = suppress_aionui_managed_capabilities(&mut config, &policy);
+
+        assert_eq!(suppressed, (0, 2));
+        assert_eq!(config.mcp_server_ids, Some(Vec::new()));
+        assert_eq!(config.session_mcp_servers.len(), 1);
+        assert_eq!(config.session_mcp_servers[0].name, STEWARD_MCP_SERVER_NAME);
+    }
+
+    #[test]
+    fn steward_isolation_drops_legacy_team_and_user_capabilities_under_any_policy() {
+        let mut config = AcpBuildExtra {
+            steward: true,
+            skills: vec!["worker-skill".into()],
+            mcp_server_ids: Some(vec!["ordinary-mcp".into()]),
+            session_mcp_servers: vec![
+                SessionMcpServer {
+                    id: STEWARD_MCP_SERVER_NAME.into(),
+                    name: STEWARD_MCP_SERVER_NAME.into(),
+                    transport: SessionMcpTransport::Stdio {
+                        command: "aioncore".into(),
+                        args: vec!["mcp-steward-stdio".into()],
+                        env: Default::default(),
+                    },
+                },
+                SessionMcpServer {
+                    id: "ordinary-mcp".into(),
+                    name: "ordinary-mcp".into(),
+                    transport: SessionMcpTransport::Stdio {
+                        command: "ordinary".into(),
+                        args: Vec::new(),
+                        env: Default::default(),
+                    },
+                },
+            ],
+            team_mcp_stdio_config: Some(aionui_api_types::TeamMcpStdioConfig {
+                team_id: "legacy-team".into(),
+                port: 4242,
+                token: "token".into(),
+                slot_id: "legacy-leader".into(),
+                binary_path: "/tmp/aioncore".into(),
+            }),
+            ..Default::default()
+        };
+
+        isolate_steward_capabilities(&mut config);
+
+        assert!(config.skills.is_empty());
+        assert_eq!(config.mcp_server_ids, Some(Vec::new()));
+        assert_eq!(config.session_mcp_servers.len(), 1);
+        assert_eq!(config.session_mcp_servers[0].name, STEWARD_MCP_SERVER_NAME);
+        assert!(config.team_mcp_stdio_config.is_none());
+    }
+
+    #[test]
+    fn steward_runtime_env_is_ephemeral_and_scoped_to_the_control_server() {
+        let mut config = AcpBuildExtra {
+            steward: true,
+            session_mcp_servers: vec![
+                SessionMcpServer {
+                    id: STEWARD_MCP_SERVER_NAME.into(),
+                    name: STEWARD_MCP_SERVER_NAME.into(),
+                    transport: SessionMcpTransport::Stdio {
+                        command: "aioncore".into(),
+                        args: vec!["mcp-steward-stdio".into()],
+                        env: std::collections::HashMap::new(),
+                    },
+                },
+                SessionMcpServer {
+                    id: "ordinary".into(),
+                    name: "ordinary".into(),
+                    transport: SessionMcpTransport::Stdio {
+                        command: "ordinary-tool".into(),
+                        args: Vec::new(),
+                        env: std::collections::HashMap::new(),
+                    },
+                },
+            ],
+            ..Default::default()
+        };
+        let runtime_env = vec![
+            ("AIONUI_BASE_URL".into(), "http://127.0.0.1:1".into()),
+            ("AIONUI_RUNTIME_TOKEN".into(), "ephemeral".into()),
+            ("PATH".into(), "/ignored".into()),
+        ];
+
+        let injected = inject_steward_runtime_env(&mut config, &runtime_env);
+
+        assert_eq!(injected, 2);
+        let SessionMcpTransport::Stdio { env, .. } = &config.session_mcp_servers[0].transport else {
+            panic!("steward control server should remain stdio");
+        };
+        assert_eq!(env.get("AIONUI_RUNTIME_TOKEN").map(String::as_str), Some("ephemeral"));
+        assert!(!env.contains_key("PATH"));
+        let SessionMcpTransport::Stdio { env, .. } = &config.session_mcp_servers[1].transport else {
+            panic!("ordinary server should remain stdio");
+        };
+        assert!(env.is_empty());
+    }
 
     fn make_row(
         name: &str,

@@ -676,6 +676,7 @@ async fn handle_bot_message(data_str: &str, message_tx: &mpsc::Sender<UnifiedInc
         cb.conversation_id.as_deref(),
         sender_staff_id,
     );
+    let is_group = chat_id.starts_with("group:");
 
     let user = UnifiedUser {
         id: sender_staff_id.to_string(),
@@ -693,6 +694,7 @@ async fn handle_bot_message(data_str: &str, message_tx: &mpsc::Sender<UnifiedInc
         id: cb.msg_id.clone().unwrap_or_default(),
         platform: PluginType::Dingtalk,
         chat_id,
+        is_group,
         user,
         content: UnifiedMessageContent {
             content_type,
@@ -754,6 +756,7 @@ async fn handle_card_action(
         Some(cid) if !cid.is_empty() => format!("group:{cid}"),
         _ => format!("user:{}", user_id),
     };
+    let is_group = chat_id.starts_with("group:");
 
     let user = UnifiedUser {
         id: user_id.clone(),
@@ -787,6 +790,7 @@ async fn handle_card_action(
         id: format!("card_{}", chrono_now()),
         platform: PluginType::Dingtalk,
         chat_id,
+        is_group,
         user,
         content: UnifiedMessageContent {
             content_type: MessageContentType::Action,

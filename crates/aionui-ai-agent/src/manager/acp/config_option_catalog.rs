@@ -5,6 +5,7 @@ use agent_client_protocol::schema::v1::{
 use aionui_api_types::{AgentHandshake, ModelInfoEntry, ModelInfoPayload};
 use aionui_common::normalize_keys_to_snake_case;
 use serde_json::{Map, Value};
+use std::collections::HashMap;
 
 use super::legacy_session_model::{LegacyModelEntry, LegacySessionModelState};
 
@@ -112,12 +113,83 @@ pub(crate) fn enrich_handshake_with_config_option_catalog(handshake: &AgentHands
     }
 
     if let Some(models) = derive_models_from_config_options(&config_options)
-        && let Some(value) = model_state_to_payload_value(&models)
+        && let Some(mut value) = model_state_to_payload_value(&models)
     {
+        if let Some(existing) = handshake.available_models.as_ref() {
+            preserve_model_capability_extensions(existing, &mut value);
+        }
         enriched.available_models = Some(value);
     }
 
     enriched
+}
+
+pub(crate) fn preserve_model_capability_extensions(existing: &Value, rebuilt: &mut Value) {
+    let existing_models = existing
+        .as_object()
+        .and_then(|payload| {
+            payload
+                .get("available_models")
+                .or_else(|| payload.get("availableModels"))
+        })
+        .and_then(Value::as_array);
+    let Some(existing_models) = existing_models else {
+        return;
+    };
+
+    let extensions_by_model: HashMap<&str, Vec<(&str, &Value)>> = existing_models
+        .iter()
+        .filter_map(|model| {
+            let id = model.get("id").and_then(Value::as_str)?;
+            let mut extensions = Vec::new();
+            if let Some(efforts) = model
+                .get("reasoning_efforts")
+                .or_else(|| model.get("reasoningEfforts"))
+                .filter(|value| value.is_array())
+            {
+                extensions.push(("reasoning_efforts", efforts));
+            }
+            if let Some(windows) = model
+                .get("available_context_windows")
+                .or_else(|| model.get("availableContextWindows"))
+                .filter(|value| value.is_array())
+            {
+                extensions.push(("available_context_windows", windows));
+            }
+            if let Some(default_window) = model
+                .get("default_context_window")
+                .or_else(|| model.get("defaultContextWindow"))
+                .filter(|value| value.as_u64().is_some())
+            {
+                extensions.push(("default_context_window", default_window));
+            }
+            (!extensions.is_empty()).then_some((id, extensions))
+        })
+        .collect();
+    if extensions_by_model.is_empty() {
+        return;
+    }
+
+    let Some(rebuilt_models) = rebuilt
+        .as_object_mut()
+        .and_then(|payload| payload.get_mut("available_models"))
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    for model in rebuilt_models {
+        let Some(id) = model.get("id").and_then(Value::as_str).map(str::to_owned) else {
+            continue;
+        };
+        let Some(extensions) = extensions_by_model.get(id.as_str()) else {
+            continue;
+        };
+        if let Some(model) = model.as_object_mut() {
+            for (key, value) in extensions {
+                model.insert((*key).to_owned(), (*value).clone());
+            }
+        }
+    }
 }
 
 pub(crate) fn extract_config_options_from_value(value: &Value) -> Option<Vec<SessionConfigOption>> {
@@ -362,6 +434,51 @@ mod tests {
         assert_eq!(models.available_models[0].name, "GPT-5.5");
         assert_eq!(models.available_models[1].model_id.to_string(), "gpt-5.4");
         assert_eq!(models.available_models[1].name, "gpt-5.4");
+    }
+
+    #[test]
+    fn enrichment_preserves_per_model_capability_metadata() {
+        let handshake = AgentHandshake {
+            config_options: Some(serde_json::json!({
+                "config_options": [{
+                    "id": "model",
+                    "name": "Model",
+                    "category": "model",
+                    "type": "select",
+                    "currentValue": "qmodel_38max",
+                    "options": [
+                        {"value": "qmodel_38max", "name": "Qwen3.8-Max"},
+                        {"value": "lite", "name": "Lite"}
+                    ]
+                }]
+            })),
+            available_models: Some(serde_json::json!({
+                "available_models": [
+                    {
+                        "id": "qmodel_38max",
+                        "label": "Qwen3.8-Max",
+                        "reasoning_efforts": ["xhigh", "medium", "low", "none"],
+                        "available_context_windows": [200000, 400000, 1000000],
+                        "default_context_window": 200000
+                    },
+                    {"id": "lite", "label": "Lite", "reasoning_efforts": []}
+                ]
+            })),
+            ..Default::default()
+        };
+
+        let enriched = enrich_handshake_with_config_option_catalog(&handshake);
+        let models = &enriched.available_models.expect("model catalog")["available_models"];
+        assert_eq!(
+            models[0]["reasoning_efforts"],
+            serde_json::json!(["xhigh", "medium", "low", "none"])
+        );
+        assert_eq!(
+            models[0]["available_context_windows"],
+            serde_json::json!([200_000, 400_000, 1_000_000])
+        );
+        assert_eq!(models[0]["default_context_window"], serde_json::json!(200_000));
+        assert_eq!(models[1]["reasoning_efforts"], serde_json::json!([]));
     }
 
     #[test]

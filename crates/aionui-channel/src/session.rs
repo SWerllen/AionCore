@@ -37,22 +37,54 @@ impl SessionManager {
         agent_type: &str,
         workspace: Option<&str>,
     ) -> Result<AssistantSessionRow, ChannelError> {
+        self.get_or_create_bound_session(owner_user_id, user_id, chat_id, agent_type, workspace, None)
+            .await
+    }
+
+    /// Finds or creates a session and, when supplied, pins it to an existing
+    /// conversation. This is used by the steward target so IM and WebUI share
+    /// one durable conversation instead of creating a channel-owned copy.
+    pub async fn get_or_create_bound_session(
+        &self,
+        owner_user_id: &str,
+        user_id: &str,
+        chat_id: &str,
+        agent_type: &str,
+        workspace: Option<&str>,
+        conversation_id: Option<&str>,
+    ) -> Result<AssistantSessionRow, ChannelError> {
         let now = now_ms();
         let new_row = AssistantSessionRow {
             id: generate_id(),
             user_id: user_id.to_owned(),
             agent_type: agent_type.to_owned(),
-            conversation_id: None,
+            conversation_id: conversation_id.map(String::from),
             workspace: workspace.map(String::from),
             chat_id: Some(chat_id.to_owned()),
             created_at: now,
             last_activity: now,
         };
 
-        let session = self
+        let mut session = self
             .repo
             .get_or_create_session(owner_user_id, user_id, chat_id, &new_row)
             .await?;
+
+        // A settings write normally clears old sessions. Reconcile the binding
+        // as well so a crash between persisting the target and clearing its
+        // sessions cannot route the next message to the stale conversation.
+        if let Some(conversation_id) = conversation_id
+            && session.conversation_id.as_deref() != Some(conversation_id)
+        {
+            self.repo
+                .update_session_conversation(owner_user_id, &session.id, conversation_id)
+                .await?;
+            self.repo
+                .update_session_agent_type(owner_user_id, &session.id, agent_type)
+                .await?;
+            session.conversation_id = Some(conversation_id.to_owned());
+            session.agent_type = agent_type.to_owned();
+        }
 
         debug!(
             session_id = %session.id,
@@ -82,6 +114,21 @@ impl SessionManager {
         agent_type: &str,
         workspace: Option<&str>,
     ) -> Result<AssistantSessionRow, ChannelError> {
+        self.reset_bound_session(owner_user_id, user_id, chat_id, agent_type, workspace, None)
+            .await
+    }
+
+    /// Resets the channel session while optionally retaining a fixed backing
+    /// conversation (the steward target deliberately keeps its shared context).
+    pub async fn reset_bound_session(
+        &self,
+        owner_user_id: &str,
+        user_id: &str,
+        chat_id: &str,
+        agent_type: &str,
+        workspace: Option<&str>,
+        conversation_id: Option<&str>,
+    ) -> Result<AssistantSessionRow, ChannelError> {
         // Delete old session if it exists
         self.repo
             .delete_session_by_user_chat(owner_user_id, user_id, chat_id)
@@ -93,7 +140,7 @@ impl SessionManager {
             id: generate_id(),
             user_id: user_id.to_owned(),
             agent_type: agent_type.to_owned(),
-            conversation_id: None,
+            conversation_id: conversation_id.map(String::from),
             workspace: workspace.map(String::from),
             chat_id: Some(chat_id.to_owned()),
             created_at: now,

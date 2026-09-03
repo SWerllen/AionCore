@@ -1,6 +1,8 @@
-use aionui_common::ErrorChain;
-use aionui_db::MessageRowUpdate;
+use std::collections::HashSet;
+
+use aionui_common::{ErrorChain, now_ms};
 use aionui_db::models::MessageRow;
+use aionui_db::{ConversationRowUpdate, MessageRowUpdate};
 use tracing::{info, warn};
 
 use crate::runtime_persistence::RuntimeWriteKind;
@@ -22,24 +24,37 @@ enum StartupRecoveryAction {
 
 impl ConversationService {
     pub async fn recover_stale_runtime_state_on_startup(&self) {
+        self.settle_stale_runtime_state(RuntimeWriteKind::StartupRecovery, "startup")
+            .await;
+    }
+
+    /// Close assistant-side rows after all agent tasks have been stopped during
+    /// graceful shutdown. This uses a dedicated persistence write kind because
+    /// ordinary stream finalization is intentionally blocked once the runtime
+    /// enters `ShuttingDown`.
+    pub async fn settle_stale_runtime_state_on_shutdown(&self) {
+        self.settle_stale_runtime_state(RuntimeWriteKind::ShutdownRecovery, "shutdown")
+            .await;
+    }
+
+    async fn settle_stale_runtime_state(&self, write_kind: RuntimeWriteKind, recovery_cause: &'static str) {
         let rows = match self.conversation_repo().list_stale_runtime_messages().await {
             Ok(rows) => rows,
             Err(error) => {
                 warn!(
+                    recovery_cause,
                     error = %ErrorChain(&error),
-                    "startup recovery skipped because stale runtime message query failed"
+                    "runtime recovery skipped because stale runtime message query failed"
                 );
                 return;
             }
         };
 
         let mut recovered = 0usize;
+        let mut recovered_conversations = HashSet::new();
         for stale in rows {
             let row = stale.message;
-            if !self
-                .runtime_persistence()
-                .allows(&row.conversation_id, RuntimeWriteKind::StartupRecovery)
-            {
+            if !self.runtime_persistence().allows(&row.conversation_id, write_kind) {
                 continue;
             }
 
@@ -61,27 +76,55 @@ impl ConversationService {
             {
                 Ok(()) => {
                     recovered += 1;
+                    recovered_conversations.insert((stale.user_id, row.conversation_id.clone()));
                     info!(
                         conversation_id = %row.conversation_id,
                         msg_id = ?row.msg_id,
                         message_type = %row.r#type,
                         recovery_action = ?action,
-                        "startup recovery closed stale runtime message"
+                        recovery_cause,
+                        "runtime recovery closed stale runtime message"
                     );
                 }
                 Err(error) => {
                     warn!(
                         conversation_id = %row.conversation_id,
                         msg_id = ?row.msg_id,
+                        recovery_cause,
                         error = %ErrorChain(&error),
-                        "startup recovery failed to close stale runtime message"
+                        "runtime recovery failed to close stale runtime message"
                     );
                 }
             }
         }
 
+        let mut recovered_conversation_count = 0usize;
+        for (user_id, conversation_id) in recovered_conversations {
+            let update = ConversationRowUpdate {
+                status: Some("finished".to_owned()),
+                updated_at: Some(now_ms()),
+                ..Default::default()
+            };
+            match self
+                .conversation_repo()
+                .update(&user_id, &conversation_id, &update)
+                .await
+            {
+                Ok(()) => recovered_conversation_count += 1,
+                Err(error) => warn!(
+                    conversation_id,
+                    recovery_cause,
+                    error = %ErrorChain(&error),
+                    "runtime recovery failed to close conversation"
+                ),
+            }
+        }
+
         if recovered > 0 {
-            info!(recovered, "startup recovery completed for stale runtime messages");
+            info!(
+                recovered,
+                recovered_conversation_count, recovery_cause, "runtime recovery completed for stale runtime messages"
+            );
         }
     }
 }

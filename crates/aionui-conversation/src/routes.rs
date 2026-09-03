@@ -15,7 +15,7 @@ use aionui_api_types::{
     SendMessageRequest, SendMessageResponse, UpdateConversationArtifactRequest, UpdateConversationRequest,
 };
 use aionui_auth::CurrentUser;
-use aionui_common::ApiError;
+use aionui_common::{ApiError, generate_short_id};
 
 use crate::ConversationError;
 use crate::state::ConversationRouterState;
@@ -308,6 +308,28 @@ async fn send_msg(
     body: Result<Json<SendMessageRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<ApiResponse<SendMessageResponse>>), ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    if !req.hidden && req.files.is_empty() && req.sessions.is_empty() && req.inject_skills.is_empty() {
+        let command = state
+            .steward
+            .try_execute_command_for_conversation(&user.id, &id, &req.content)
+            .await
+            .map_err(ApiError::from)?;
+        if command.handled {
+            let msg_id = command
+                .user_msg_id
+                .unwrap_or_else(|| format!("steward-command-{}", generate_short_id()));
+            let turn_id = command.response_msg_id.unwrap_or_else(|| msg_id.clone());
+            return Ok((
+                StatusCode::OK,
+                Json(ApiResponse::ok(SendMessageResponse {
+                    msg_id,
+                    turn_id,
+                    delivered_midturn: false,
+                    runtime: state.service.runtime_summary_for(&id).await,
+                })),
+            ));
+        }
+    }
     let response = state
         .service
         .send_message(&user.id, &id, req, &state.task_manager)
