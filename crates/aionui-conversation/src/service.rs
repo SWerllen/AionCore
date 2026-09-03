@@ -4976,6 +4976,7 @@ impl ConversationService {
                     "embedded team conversation is missing its application orchestrator",
                 ));
             };
+            let recovered = task_manager.get_task(conversation_id).is_none();
             orchestrator.ensure_runtime(user_id, conversation_id, &team_id).await?;
             let agent =
                 task_manager
@@ -4997,7 +4998,7 @@ impl ConversationService {
                 )
                 .await?;
             return Ok(EnsureConversationRuntimeResponse {
-                recovered: false,
+                recovered,
                 config_options,
                 runtime: self.runtime_summary_for(conversation_id).await,
             });
