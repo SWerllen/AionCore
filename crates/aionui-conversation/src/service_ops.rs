@@ -28,9 +28,9 @@ const QODER_CONTEXT_WINDOW_OPTION_ID: &str = "context_window";
 const QODER_CONTEXT_WINDOW_DEFAULT: &str = "default";
 
 fn format_context_window(value: u64) -> String {
-    if value >= 1_000_000 && value % 1_000_000 == 0 {
+    if value >= 1_000_000 && value.is_multiple_of(1_000_000) {
         format!("{}M", value / 1_000_000)
-    } else if value >= 1_000 && value % 1_000 == 0 {
+    } else if value >= 1_000 && value.is_multiple_of(1_000) {
         format!("{}K", value / 1_000)
     } else {
         value.to_string()
