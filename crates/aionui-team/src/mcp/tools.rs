@@ -193,12 +193,12 @@ mod tests {
             .description;
         assert_eq!(desc, TEAM_SPAWN_AGENT_DESCRIPTION);
         assert!(
-            desc.contains("Before calling this tool"),
-            "description must be the full AionUi original, not the legacy one-liner"
+            desc.contains("current conversation leader"),
+            "description must retain the leader-directed staffing contract"
         );
         assert!(
-            desc.contains("explicitly approved"),
-            "description must retain the explicit-approval precondition clause"
+            desc.contains("team-mode or staffing confirmation is not required"),
+            "description must retain the autonomous staffing precondition"
         );
     }
 
@@ -371,7 +371,8 @@ mod tests {
             .into_iter()
             .find(|d| d.name == "team_spawn_agent")
             .unwrap();
-        assert!(desc.description.contains("recommended assistant"));
+        assert!(desc.description.contains("available assistants catalog"));
+        assert!(desc.description.contains("worker_profile_id"));
         assert!(!desc.description.contains("recommended model"));
         assert!(!desc.description.contains("model parameter"));
         assert!(!desc.description.contains("recommended assistant or backend"));

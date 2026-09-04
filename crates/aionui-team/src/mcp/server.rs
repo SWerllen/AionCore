@@ -1885,7 +1885,8 @@ mod tests {
         let service: Weak<TeamSessionService> = Weak::new();
         let args = json!({
             "name": "Helper",
-            "assistant_id": "word-creator"
+            "assistant_id": "word-creator",
+            "worker_profile_id": "profile-balanced"
         });
         let result = exec_spawn_agent(&args, &service, "team-1", "lead-1", TeammateRole::Lead).await;
         let err = result.expect_err("dead Weak<TeamSessionService> must not succeed");
@@ -1940,7 +1941,10 @@ mod tests {
     #[tokio::test]
     async fn exec_spawn_agent_requires_assistant_identity() {
         let service: Weak<TeamSessionService> = Weak::new();
-        let args = json!({ "name": "Helper" });
+        let args = json!({
+            "name": "Helper",
+            "worker_profile_id": "profile-balanced"
+        });
         let result = exec_spawn_agent(&args, &service, "team-1", "lead-1", TeammateRole::Lead).await;
         let err = result.expect_err("assistant_id must now be required");
         assert!(

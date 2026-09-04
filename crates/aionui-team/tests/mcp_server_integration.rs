@@ -616,7 +616,11 @@ async fn sp1_lead_spawn_requires_live_session_service() {
         &mut stream,
         2,
         "team_spawn_agent",
-        json!({"name": "Helper", "assistant_id": "word-creator"}),
+        json!({
+            "name": "Helper",
+            "assistant_id": "word-creator",
+            "worker_profile_id": "profile-balanced"
+        }),
     )
     .await;
 

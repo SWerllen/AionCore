@@ -1644,16 +1644,16 @@ pub(crate) mod workspace_harness {
         }
     }
 
-    struct EmptyProviderRepo;
+    struct TestProviderRepo;
 
     #[async_trait]
-    impl IProviderRepository for EmptyProviderRepo {
+    impl IProviderRepository for TestProviderRepo {
         async fn list(&self, _user_id: &str) -> Result<Vec<aionui_db::models::Provider>, DbError> {
-            Ok(vec![])
+            Ok(vec![test_provider_row()])
         }
 
-        async fn find_by_id(&self, _user_id: &str, _id: &str) -> Result<Option<aionui_db::models::Provider>, DbError> {
-            Ok(None)
+        async fn find_by_id(&self, _user_id: &str, id: &str) -> Result<Option<aionui_db::models::Provider>, DbError> {
+            Ok((id == "test-provider").then(test_provider_row))
         }
 
         async fn create(
@@ -1674,6 +1674,29 @@ pub(crate) mod workspace_harness {
 
         async fn delete(&self, _user_id: &str, _id: &str) -> Result<(), DbError> {
             Ok(())
+        }
+    }
+
+    fn test_provider_row() -> aionui_db::models::Provider {
+        aionui_db::models::Provider {
+            id: "test-provider".into(),
+            user_id: "user-test".into(),
+            platform: "openai".into(),
+            name: "Test Provider".into(),
+            base_url: "https://example.com".into(),
+            api_key_encrypted: String::new(),
+            models: serde_json::to_string(&["claude-sonnet"]).unwrap(),
+            enabled: true,
+            capabilities: "[]".into(),
+            context_limit: None,
+            model_protocols: None,
+            model_enabled: None,
+            model_health: None,
+            model_settings: "{}".into(),
+            bedrock_config: None,
+            is_full_url: false,
+            created_at: 0,
+            updated_at: 0,
         }
     }
 
@@ -1756,7 +1779,7 @@ pub(crate) mod workspace_harness {
             Arc::new(EmptyTeamAssistantCatalog),
             Arc::new(EmptyAssistantDefinitionRepo),
             Arc::new(EmptyAssistantOverlayRepo),
-            Arc::new(EmptyProviderRepo),
+            Arc::new(TestProviderRepo),
             conversation_port,
             projection_store,
             broadcaster_dyn,

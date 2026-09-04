@@ -364,16 +364,16 @@ fn lp3_lead_prompt_contains_task_management_guidance() {
     let prompt = build_lead_prompt(&lead, "Gamma", &[], &default_assistants());
 
     assert!(
-        prompt.contains("Break the work into tasks"),
+        prompt.contains("Break the delegated work into tasks"),
         "missing decompose guidance"
     );
     assert!(
-        prompt.contains("assigning a task to a teammate") && prompt.contains("automatically notifies and wakes"),
+        prompt.contains("Assigning an") && prompt.contains("owner automatically notifies and wakes that worker"),
         "missing task-assignment auto-notify/wake guidance"
     );
     assert!(prompt.contains("dependency"), "missing dependency guidance");
     assert!(
-        prompt.contains("When teammates report back"),
+        prompt.contains("When workers report back"),
         "missing teammate result-review guidance"
     );
 }

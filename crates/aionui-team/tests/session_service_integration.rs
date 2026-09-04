@@ -1760,15 +1760,15 @@ impl TeamAssistantCatalogPort for TestTeamAssistantCatalog {
     }
 }
 
-struct EmptyProviderRepo;
+struct TestProviderRepo;
 
 #[async_trait::async_trait]
-impl IProviderRepository for EmptyProviderRepo {
+impl IProviderRepository for TestProviderRepo {
     async fn list(&self, _user_id: &str) -> Result<Vec<aionui_db::models::Provider>, DbError> {
-        Ok(vec![])
+        Ok(vec![test_provider_row()])
     }
-    async fn find_by_id(&self, _user_id: &str, _id: &str) -> Result<Option<aionui_db::models::Provider>, DbError> {
-        Ok(None)
+    async fn find_by_id(&self, _user_id: &str, id: &str) -> Result<Option<aionui_db::models::Provider>, DbError> {
+        Ok((id == "test-provider").then(test_provider_row))
     }
     async fn create(
         &self,
@@ -1786,6 +1786,29 @@ impl IProviderRepository for EmptyProviderRepo {
     }
     async fn delete(&self, _user_id: &str, _id: &str) -> Result<(), DbError> {
         Err(DbError::NotFound("not implemented".into()))
+    }
+}
+
+fn test_provider_row() -> aionui_db::models::Provider {
+    aionui_db::models::Provider {
+        id: "test-provider".into(),
+        user_id: "user1".into(),
+        platform: "openai".into(),
+        name: "Test Provider".into(),
+        base_url: "https://example.com".into(),
+        api_key_encrypted: String::new(),
+        models: serde_json::to_string(&["claude"]).unwrap(),
+        enabled: true,
+        capabilities: "[]".into(),
+        context_limit: None,
+        model_protocols: None,
+        model_enabled: None,
+        model_health: None,
+        model_settings: "{}".into(),
+        bedrock_config: None,
+        is_full_url: false,
+        created_at: 0,
+        updated_at: 0,
     }
 }
 
@@ -2225,7 +2248,7 @@ fn setup_with_factory_metadata_team_repo_and_conversation_repo(
     let task_manager = Arc::new(CountingTaskManager::new(factory));
     let task_manager_dyn: Arc<dyn IWorkerTaskManager> = task_manager.clone();
     let backend_binary_path = Arc::new(std::path::PathBuf::from("/tmp/aioncore-test"));
-    let provider_repo: Arc<dyn IProviderRepository> = Arc::new(EmptyProviderRepo);
+    let provider_repo: Arc<dyn IProviderRepository> = Arc::new(TestProviderRepo);
     let svc = TeamSessionService::new_with_capability_port(
         team_repo_dyn,
         agent_metadata_repo,
@@ -2266,7 +2289,7 @@ fn setup_with_factory_metadata_assistants_and_conversation_repo(
     let task_manager = Arc::new(CountingTaskManager::new(factory));
     let task_manager_dyn: Arc<dyn IWorkerTaskManager> = task_manager.clone();
     let backend_binary_path = Arc::new(std::path::PathBuf::from("/tmp/aioncore-test"));
-    let provider_repo: Arc<dyn IProviderRepository> = Arc::new(EmptyProviderRepo);
+    let provider_repo: Arc<dyn IProviderRepository> = Arc::new(TestProviderRepo);
     let assistant_catalog: Arc<dyn TeamAssistantCatalogPort> = Arc::new(TestTeamAssistantCatalog {
         agent_metadata_repo: agent_metadata_repo.clone(),
         assistant_definition_repo: assistant_definition_repo.clone(),
@@ -2350,7 +2373,7 @@ fn setup_with_ports_metadata_assistants_profiles_and_conversation_repo(
     let task_manager = Arc::new(CountingTaskManager::new(factory));
     let task_manager_dyn: Arc<dyn IWorkerTaskManager> = task_manager.clone();
     let backend_binary_path = Arc::new(std::path::PathBuf::from("/tmp/aioncore-test"));
-    let provider_repo: Arc<dyn IProviderRepository> = Arc::new(EmptyProviderRepo);
+    let provider_repo: Arc<dyn IProviderRepository> = Arc::new(TestProviderRepo);
     let assistant_catalog: Arc<dyn TeamAssistantCatalogPort> = Arc::new(TestTeamAssistantCatalog {
         agent_metadata_repo: agent_metadata_repo.clone(),
         assistant_definition_repo: assistant_definition_repo.clone(),
@@ -2392,7 +2415,7 @@ fn setup_with_recording_turn_port() -> (
     let task_manager: Arc<dyn IWorkerTaskManager> = Arc::new(CountingTaskManager::new(success_factory()));
     let turn_port = Arc::new(RecordingTurnPort::default());
     let backend_binary_path = Arc::new(std::path::PathBuf::from("/tmp/aioncore-test"));
-    let provider_repo: Arc<dyn IProviderRepository> = Arc::new(EmptyProviderRepo);
+    let provider_repo: Arc<dyn IProviderRepository> = Arc::new(TestProviderRepo);
     let svc = TeamSessionService::new_with_capability_port(
         team_repo_dyn,
         Arc::new(StubAgentMetadataRepo::empty()),
@@ -2598,7 +2621,7 @@ fn setup_with_recording_broadcaster() -> (Arc<TeamSessionService>, Arc<Recording
     let projection_store: Arc<dyn TeamProjectionMessageStore> = conversation_ports.clone();
     let task_manager: Arc<dyn IWorkerTaskManager> = Arc::new(CountingTaskManager::new(success_factory()));
     let backend_binary_path = Arc::new(std::path::PathBuf::from("/tmp/aioncore-test"));
-    let provider_repo: Arc<dyn IProviderRepository> = Arc::new(EmptyProviderRepo);
+    let provider_repo: Arc<dyn IProviderRepository> = Arc::new(TestProviderRepo);
     let svc = TeamSessionService::new_with_capability_port(
         team_repo,
         agent_metadata_repo,
@@ -2652,7 +2675,7 @@ fn setup_with_factory_recording_broadcaster_and_conversation_repo(factory: Agent
     let task_manager = Arc::new(CountingTaskManager::new(factory));
     let task_manager_dyn: Arc<dyn IWorkerTaskManager> = task_manager.clone();
     let backend_binary_path = Arc::new(std::path::PathBuf::from("/tmp/aioncore-test"));
-    let provider_repo: Arc<dyn IProviderRepository> = Arc::new(EmptyProviderRepo);
+    let provider_repo: Arc<dyn IProviderRepository> = Arc::new(TestProviderRepo);
     let svc = TeamSessionService::new_with_capability_port(
         team_repo_dyn,
         agent_metadata_repo,
