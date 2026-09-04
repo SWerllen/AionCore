@@ -737,7 +737,7 @@ async fn rn1b_run_now_returns_active_conversation_when_conversation_is_busy() {
 }
 
 #[tokio::test]
-async fn rn1c_run_now_new_conversation_preset_assistant_uses_fixed_assistant_mcps() {
+async fn rn1c_run_now_native_agent_keeps_fixed_assistant_mcp_out_of_runtime() {
     let (mut app, services) = build_app_with_mock_agents().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
@@ -815,8 +815,6 @@ async fn rn1c_run_now_new_conversation_preset_assistant_uses_fixed_assistant_mcp
     let job_id = create_job_body["data"]["id"]
         .as_str()
         .expect("cron job id should be present");
-    let saved_skill_name = format!("cron-{job_id}");
-
     let save_skill_req = json_with_token(
         "POST",
         &format!("/api/cron/jobs/{job_id}/skill"),
@@ -859,14 +857,9 @@ async fn rn1c_run_now_new_conversation_preset_assistant_uses_fixed_assistant_mcp
     assert!(extra.get("assistant_id").is_none());
     assert!(extra.get("preset_assistant_id").is_none());
     assert!(extra.get("custom_agent_id").is_none());
-    assert_eq!(extra["mcp_server_ids"], json!([fixed_mcp.id]));
-    assert_eq!(extra["mcp_servers"], json!(["fixed-mcp"]));
-    assert!(
-        extra["skills"].as_array().is_some_and(|skills| {
-            skills.iter().all(|skill| skill != "cron") && skills.iter().any(|skill| skill == &saved_skill_name)
-        }),
-        "cron-created conversations must exclude builtin cron but keep the saved job skill"
-    );
+    assert_eq!(extra["mcp_server_ids"], json!([]));
+    assert_eq!(extra["mcp_servers"], json!([]));
+    assert_eq!(extra["skills"], json!([]));
     assert_ne!(fixed_mcp.id, extra_mcp.id, "fixture should seed two distinct MCP rows");
 
     let snapshot = conversation_repo

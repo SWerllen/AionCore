@@ -3279,13 +3279,8 @@ impl TeamSessionService {
         reason: Option<String>,
     ) -> Result<(), TeamError> {
         self.load_owned_team(user_id, team_id).await?;
-        self.ensure_session_inner(team_id, Some(user_id)).await?;
-        let session = {
-            let entry = self
-                .sessions
-                .get(team_id)
-                .ok_or_else(|| TeamError::SessionNotFound(team_id.into()))?;
-            Arc::clone(&entry.session)
+        let Some(session) = self.sessions.get(team_id).map(|entry| Arc::clone(&entry.session)) else {
+            return Ok(());
         };
         session.cancel_run(team_run_id, target_slot_id, reason).await
     }

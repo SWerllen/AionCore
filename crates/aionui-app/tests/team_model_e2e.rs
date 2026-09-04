@@ -39,7 +39,16 @@ async fn create_team(app: &mut axum::Router, services: &aionui_app::AppServices,
         json!({
             "id": TEAM_ASSISTANT_ID,
             "name": "Team Model E2E Assistant",
-            "agent_id": TEAM_AGENT_ID
+            "agent_id": TEAM_AGENT_ID,
+            "worker_profiles": [{
+                "name": "Team Model E2E Worker",
+                "model_id": "gpt-5.5",
+                "difficulty_ceiling": 5,
+                "estimated_cost_micros": 0,
+                "currency": "CNY",
+                "enabled": true,
+                "sort_order": 0
+            }]
         }),
         token,
         csrf,
@@ -71,8 +80,10 @@ async fn create_team(app: &mut axum::Router, services: &aionui_app::AppServices,
         csrf,
     );
     let resp = app.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::CREATED);
-    body_json(resp).await["data"].clone()
+    let status = resp.status();
+    let body = body_json(resp).await;
+    assert_eq!(status, StatusCode::CREATED, "create team response: {body}");
+    body["data"].clone()
 }
 
 #[tokio::test]

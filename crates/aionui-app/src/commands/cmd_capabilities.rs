@@ -152,6 +152,10 @@ fn data() -> Value {
                 "description": "Internal team MCP stdio server."
             },
             {
+                "name": "mcp-steward-stdio",
+                "description": "Internal steward-control MCP stdio server."
+            },
+            {
                 "name": "prepare-managed-resources",
                 "description": "Packaging helper for managed runtime resources."
             },

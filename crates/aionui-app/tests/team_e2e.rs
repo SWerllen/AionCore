@@ -1398,6 +1398,15 @@ async fn es1c_team_conversations_carry_assistant_bound_mcp_snapshot() {
             "id": DEFAULT_TEAM_ASSISTANT_ID,
             "name": "Team E2E MCP Assistant",
             "agent_id": DEFAULT_TEAM_AGENT_ID,
+            "worker_profiles": [{
+                "name": "Team E2E MCP Worker",
+                "model_id": "claude",
+                "difficulty_ceiling": 5,
+                "estimated_cost_micros": 0,
+                "currency": "CNY",
+                "enabled": true,
+                "sort_order": 0
+            }],
             "defaults": {
                 "mcps": {
                     "mode": "fixed",
@@ -1419,6 +1428,15 @@ async fn es1c_team_conversations_carry_assistant_bound_mcp_snapshot() {
             "id": unbound_assistant_id,
             "name": "Team E2E Empty MCP Assistant",
             "agent_id": DEFAULT_TEAM_AGENT_ID,
+            "worker_profiles": [{
+                "name": "Team E2E Empty MCP Worker",
+                "model_id": "claude",
+                "difficulty_ceiling": 5,
+                "estimated_cost_micros": 0,
+                "currency": "CNY",
+                "enabled": true,
+                "sort_order": 0
+            }],
             "defaults": { "mcps": { "mode": "fixed", "value": [] } }
         }),
         &token,
@@ -1451,8 +1469,13 @@ async fn es1c_team_conversations_carry_assistant_bound_mcp_snapshot() {
         &csrf,
     );
     let create_resp = app.clone().oneshot(create_req).await.unwrap();
-    assert_eq!(create_resp.status(), StatusCode::CREATED);
+    let create_status = create_resp.status();
     let create_body = body_json(create_resp).await;
+    assert_eq!(
+        create_status,
+        StatusCode::CREATED,
+        "create team response: {create_body}"
+    );
     let data = &create_body["data"];
     let team_id = data["id"].as_str().unwrap();
     let lead = &data["assistants"][0];

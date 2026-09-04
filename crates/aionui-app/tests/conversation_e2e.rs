@@ -249,13 +249,8 @@ async fn t1_3b_create_persists_available_locale_fallback_rule_in_assistant_snaps
     assert_eq!(data["extra"]["current_mode_id"], "workspace-write");
     assert_eq!(data["extra"]["current_model_id"], "override-model");
     assert!(data["extra"].get("assistant_snapshot").is_none());
-    assert!(
-        data["extra"]["skills"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|skill| skill == "override-skill")
-    );
+    assert_eq!(data["extra"]["skills"], json!([]));
+    assert_eq!(data["extra"]["mcp_server_ids"], json!([]));
 
     let user_id = conversation_repo
         .owner_user_id(data["id"].as_str().unwrap())

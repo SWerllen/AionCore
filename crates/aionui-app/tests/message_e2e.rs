@@ -732,17 +732,19 @@ async fn t2_1_send_message_accepted() {
         &csrf,
     );
     let resp = app.oneshot(req).await.unwrap();
-    // The stub agent factory returns an error, so we expect 500
+    // The stub agent factory returns an error, so we expect an upstream error
     // (the route itself is wired correctly — 202 when factory is real)
     // In E2E with stub factory, the get_or_build_task fails.
     // We verify the route is reachable and returns an error (not 404/405).
-    // 400 may occur when the stub environment lacks valid backend configuration.
+    // 400 may occur when the stub environment lacks valid backend configuration;
+    // embedded-team leader startup failures are exposed as 502.
     let status = resp.status();
     assert!(
         status == StatusCode::ACCEPTED
             || status == StatusCode::INTERNAL_SERVER_ERROR
+            || status == StatusCode::BAD_GATEWAY
             || status == StatusCode::BAD_REQUEST,
-        "Expected 202, 400, or 500 (stub factory), got {status}"
+        "Expected 202, 400, 500, or 502 (stub factory), got {status}"
     );
 
     if status == StatusCode::ACCEPTED {

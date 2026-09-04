@@ -1,10 +1,9 @@
-//! E2E tests for mid-turn message delivery (B5, mid-turn interjection Task 4).
+//! E2E tests for message delivery after ordinary conversations became latent
+//! embedded teams.
 //!
-//! While a turn is ACTIVE:
-//! - a backend with `supports_midturn_delivery=true` accepts a second message
-//!   with HTTP 200 and folds it into the CURRENT turn (response `turn_id` ==
-//!   the active turn's id, no new turn opened);
-//! - a backend without it keeps today's 409 CONFLICT.
+//! The embedded-team scheduler is now the owner of every visible user turn.
+//! While its leader is active, a second message is accepted as a new queued
+//! team run regardless of the backend's direct mid-turn capability.
 
 mod common;
 
@@ -176,11 +175,8 @@ async fn wait_for_agent_registered(services: &aionui_app::AppServices, conv_id: 
     panic!("agent for {conv_id} never registered with the task manager");
 }
 
-/// Brief Step 1: during an active turn, a second message to a
-/// `supports_midturn_delivery` backend gets HTTP 200 (not 409) and the response
-/// `turn_id` equals the CURRENT active turn's id.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn midturn_send_returns_200_with_the_active_turn_id() {
+async fn embedded_team_send_queues_a_new_run_for_midturn_capable_backend() {
     let MidturnRig {
         mut app,
         services,
@@ -193,37 +189,31 @@ async fn midturn_send_returns_200_with_the_active_turn_id() {
     let (status1, body1) = send_message(&mut app, &conv_id, "first message", &token, &csrf).await;
     assert_eq!(status1, StatusCode::ACCEPTED, "first send scheduled a turn: {body1}");
     let turn1 = body1["data"]["turn_id"].as_str().unwrap().to_owned();
-    // The mid-turn branch reads the REGISTERED agent, which turn 1 builds
-    // asynchronously; wait for it rather than racing the spawn.
+    // Prove the direct agent exists and advertises mid-turn delivery. The
+    // embedded-team boundary must still own the second visible user message.
     wait_for_agent_registered(&services, &conv_id).await;
 
-    // Mid-turn second message: 200, folded into the SAME turn.
+    // The second visible user message becomes a distinct queued team run.
     let (status2, body2) = send_message(&mut app, &conv_id, "midturn interjection", &token, &csrf).await;
     assert_eq!(
         status2,
-        StatusCode::OK,
-        "mid-turn send to a supporting backend must be 200, got {status2}: {body2}"
+        StatusCode::ACCEPTED,
+        "embedded team send must be accepted, got {status2}: {body2}"
     );
     let turn2 = body2["data"]["turn_id"].as_str().unwrap();
-    assert_eq!(
-        turn2, turn1,
-        "mid-turn delivery folds into the CURRENT turn — no new turn id"
-    );
-    assert_eq!(
-        body2["data"]["delivered_midturn"], true,
-        "the response flags mid-turn delivery for the frontend"
+    assert_ne!(turn2, turn1, "the queued message owns a distinct team run");
+    assert!(
+        body2["data"].get("delivered_midturn").is_none(),
+        "the embedded scheduler must not report direct mid-turn delivery"
     );
 
-    // Delivered through the mid-turn path (not a second normal turn).
+    // It must not bypass the scheduler through the direct-agent interjection
+    // path, even though that path is supported by this mock.
     let delivered = delivered.lock().await.clone();
-    assert_eq!(
-        delivered,
-        vec!["midturn interjection".to_owned()],
-        "the message must go through the mid-turn delivery path"
-    );
+    assert!(delivered.is_empty(), "direct mid-turn delivery must stay unused");
 
-    // The user message is persisted with the pending-receipt status and the
-    // list view shows it.
+    // The scheduler-owned user message is persisted as handed off to the team,
+    // and the list view shows it.
     let resp = app
         .clone()
         .oneshot(get_with_token(
@@ -239,15 +229,13 @@ async fn midturn_send_returns_200_with_the_active_turn_id() {
         .find(|m| m["content"]["content"] == "midturn interjection")
         .expect("mid-turn user message persisted");
     assert_eq!(
-        row["status"], "pending",
-        "a mid-turn message starts in the pending-receipt state"
+        row["status"], "finish",
+        "the team scheduler records the user message as handed off"
     );
 }
 
-/// Backends WITHOUT mid-turn delivery keep today's behavior: a second send
-/// during an active turn is 409 CONFLICT with the running-conversation error.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn midturn_send_to_non_supporting_backend_stays_409() {
+async fn embedded_team_send_also_queues_for_non_midturn_backend() {
     let MidturnRig { mut app, services, .. } = build_midturn_app(false).await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "pw").await;
     let conv_id = create_conversation(&mut app, &token, &csrf).await;
@@ -258,12 +246,8 @@ async fn midturn_send_to_non_supporting_backend_stays_409() {
     let (status2, body2) = send_message(&mut app, &conv_id, "second message", &token, &csrf).await;
     assert_eq!(
         status2,
-        StatusCode::CONFLICT,
-        "non-supporting backend keeps the 409 gate, got {status2}: {body2}"
+        StatusCode::ACCEPTED,
+        "embedded team scheduler accepts the queued run, got {status2}: {body2}"
     );
-    let err = body2["error"].as_str().unwrap_or_default();
-    assert!(
-        err.contains("already running"),
-        "the running-conversation error is preserved, got: {err}"
-    );
+    assert!(body2["data"].get("delivered_midturn").is_none());
 }

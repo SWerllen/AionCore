@@ -34,7 +34,22 @@ impl TrashSink for PlatformTrash {
     fn trash(&self, path: &Path) -> Result<(), String> {
         // `trash` fails before touching the file when the path cannot be
         // resolved, so a failure here leaves the work tree untouched.
-        trash::delete(path).map_err(|err| err.to_string())
+        #[cfg(target_os = "macos")]
+        {
+            use trash::macos::{DeleteMethod, TrashContextExtMacos};
+
+            // Finder is the crate default, but it requires Apple Events
+            // automation permission and is unavailable to a headless WebUI
+            // backend. NSFileManager reaches the same Trash without launching
+            // Finder or prompting the user for that unrelated permission.
+            let mut context = trash::TrashContext::new();
+            context.set_delete_method(DeleteMethod::NsFileManager);
+            context.delete(path).map_err(|err| err.to_string())
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            trash::delete(path).map_err(|err| err.to_string())
+        }
     }
 }
 
