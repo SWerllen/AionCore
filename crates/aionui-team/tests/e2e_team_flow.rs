@@ -1928,6 +1928,10 @@ async fn s9d_late_child_start_after_team_cancel_is_cancelled_without_reviving_ru
     let cancelled_turns = cancelled.lock().unwrap().clone();
     assert_eq!(cancelled_turns, vec!["turn-late-start".to_owned()]);
     assert_eq!(session.team_run_manager().current_active_run_id(), None);
+    session
+        .cancel_run(&ack.run.team_run_id, None, Some("duplicate stop".into()))
+        .await
+        .expect("cancelling an already terminal run must be idempotent");
 
     session.stop();
 }

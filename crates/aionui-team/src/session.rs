@@ -12,7 +12,7 @@ use aionui_api_types::{
 use aionui_common::{AgentKillReason, generate_id};
 use aionui_db::ITeamRepository;
 use aionui_realtime::EventBroadcaster;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::error::TeamError;
 use crate::event_loop::EventLoopRegistry;
@@ -1184,9 +1184,12 @@ impl TeamSession {
         reason: Option<String>,
     ) -> Result<(), TeamError> {
         if self.team_run_manager.current_active_run_id().as_deref() != Some(team_run_id) {
-            return Err(TeamError::InvalidRequest(format!(
-                "team run {team_run_id} is not active"
-            )));
+            debug!(
+                team_id = %self.team.id,
+                team_run_id,
+                "Team run cancel ignored because the run is no longer active"
+            );
+            return Ok(());
         }
         self.team_run_manager.begin_cancel(team_run_id, reason)?;
         let result = self.work_coordinator.cancel_run(team_run_id);
